@@ -44,6 +44,15 @@ def test_load_scenario_endpoint(client):
     assert len(status["canary_servers"]) == 4
 
 
+def test_load_scenario_with_browser_payload(client):
+    """POST /api/scenarios/load with exact browser payload {scenario_name: ...} returns 200."""
+    res = client.post("/api/scenarios/load", json={"scenario_name": "clean_release"})
+    assert res.status_code == 200
+    data = res.json()
+    assert data["scenario"] == "clean_release"
+    assert data["deployment"]["release_id"] == "rel-clean-v1"
+
+
 def test_compare_methods_endpoint(client):
     """GET /api/detector/compare-methods returns comparison between Hierarchical, Independent, and Pooled SSM."""
     # First load a scenario so canaries are active

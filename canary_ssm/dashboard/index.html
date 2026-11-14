@@ -42,6 +42,8 @@
       <button id="btn-start-demo" class="btn btn-primary" style="font-weight: 700; background: linear-gradient(135deg, #0284c7, #38bdf8); color: #0f172a; border: none; padding: 0.4rem 0.85rem;" title="1-Click: Reset, Load Scenario, and Start Simulation">
         ▶ Start Demo
       </button>
+      <button id="btn-demo-preset-info" class="btn" style="padding: 0.4rem 0.65rem;" title="Show Scenario Details">ℹ Info</button>
+      <button id="btn-filter-calibrated" class="btn" style="padding: 0.4rem 0.65rem;" title="Policy Calibration Status">🛡 Policy</button>
     </div>
 
     <!-- Clock & Freshness -->
@@ -295,12 +297,38 @@
             </div>
 
             <div class="form-group">
-              <label>Attach Artifact Code File (Optional)</label>
-              <input type="file" id="rel-file-input">
+              <label>Attach Artifact Code File (Optional — Unexecuted Provenance Only)</label>
+              <input type="file" id="rel-artifact-upload">
+              <input type="hidden" id="rel-artifact-file" value="">
+              <input type="hidden" id="rel-file-input" value="">
+              <div id="artifact-hash-display" style="font-size: 0.75rem; color: var(--accent-blue); margin-top: 0.35rem;"></div>
             </div>
 
             <button type="submit" class="btn btn-primary" style="width: 100%;">Create Release in Registry</button>
           </form>
+
+          <!-- Registered Releases Catalog Table -->
+          <div style="margin-top: 1.5rem;">
+            <div class="card-title">
+              <span>Registered Releases Catalog</span>
+            </div>
+            <div class="table-container">
+              <table>
+                <thead>
+                  <tr>
+                    <th>Release ID</th>
+                    <th>Version</th>
+                    <th>Profile</th>
+                    <th>Artifact</th>
+                    <th>Registered</th>
+                  </tr>
+                </thead>
+                <tbody id="releases-table-body">
+                  <tr><td colspan="5" style="text-align: center; color: var(--text-muted);">No releases registered.</td></tr>
+                </tbody>
+              </table>
+            </div>
+          </div>
         </div>
 
         <!-- Canary Allocation & Deployment -->
@@ -313,16 +341,19 @@
 
             <div class="form-group">
               <label>Active Release to Deploy</label>
-              <select id="select-active-release"></select>
+              <select id="select-deploy-release"></select>
+              <select id="select-active-release" style="display: none;"></select>
             </div>
 
             <div class="form-group">
-              <label>Target Canary Servers (comma-separated or click servers below)</label>
-              <input type="text" id="canary-servers-input" value="srv-r0-s0, srv-r1-s0, srv-r2-s0, srv-r3-s0">
+              <label>Target Canary Servers (Select via Matrix or enter IDs)</label>
+              <div id="alloc-matrix-container" style="background: var(--bg-primary); padding: 0.75rem; border-radius: 6px; border: 1px solid var(--border-color); margin-bottom: 0.5rem;"></div>
+              <input type="hidden" id="canary-servers-input" value="srv-r0-s0, srv-r1-s0, srv-r2-s0, srv-r3-s0">
             </div>
 
             <!-- Allocation Validation Report -->
-            <div id="allocation-report" class="alert-box alert-success" style="margin-bottom: 1rem; display: none;"></div>
+            <div id="alloc-validation-alert" class="alert-box alert-warning" style="margin-bottom: 1rem;">No canaries selected. Select at least 1 canary to validate identifiability.</div>
+            <div id="allocation-report" style="display: none;"></div>
 
             <div style="display: flex; gap: 0.5rem;">
               <button id="btn-validate-alloc" class="btn">Validate Allocation</button>
@@ -339,7 +370,8 @@
             <p style="font-size: 0.85rem; color: var(--text-secondary); margin-bottom: 1rem;">
               Manual rollback reverts canary servers to baseline version v1.0.0 and freezes alerts.
             </p>
-            <button id="btn-trigger-rollback" class="btn btn-danger" style="width: 100%;" disabled>Manual Rollback (Prompt Confirmation)</button>
+            <button id="btn-rollback-canary" class="btn btn-danger" style="width: 100%;">Manual Rollback (Prompt Confirmation)</button>
+            <button id="btn-trigger-rollback" style="display: none;"></button>
           </div>
 
           <!-- Command History Table -->
@@ -885,6 +917,10 @@
         <p id="rollback-modal-text" style="font-size: 0.88rem; margin-bottom: 1.25rem; line-height: 1.5;">
           Are you sure you want to rollback the active release? This will revert canary servers to baseline version v1.0.0.
         </p>
+        <label style="display: flex; align-items: center; gap: 0.5rem; font-size: 0.82rem; margin-bottom: 1.25rem; color: var(--text-secondary); cursor: pointer;">
+          <input type="checkbox" id="cb-restart-process" checked>
+          Restart server process (clear allocated heap memory)
+        </label>
         <div style="display: flex; gap: 0.75rem; justify-content: flex-end;">
           <button id="rollback-modal-cancel" class="btn">Cancel</button>
           <button id="rollback-modal-confirm" class="btn btn-danger">Confirm Rollback</button>

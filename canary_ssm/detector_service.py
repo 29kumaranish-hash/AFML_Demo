@@ -586,7 +586,14 @@ class DetectorService:
     ) -> None:
         self.expected_servers = list(expected_servers)
         self.server_metadata = dict(server_metadata)
-        self.frozen_policy = frozen_policy or FrozenPolicy()
+        if frozen_policy is not None:
+            self.frozen_policy = frozen_policy
+        elif enable_auto_rollback:
+            # When automated intervention is requested without explicit policy,
+            # activate the verified Gate G2 calibrated policy to guarantee fleet-wide false-alert control.
+            self.frozen_policy = create_calibrated_hier_policy()
+        else:
+            self.frozen_policy = FrozenPolicy()
         self.protocol = slicing_protocol or SlicingProtocol(min_controls_per_rack=3, min_controls_per_class=3)
         self.effect_params = effect_params or EffectParams(kind="hier", rho_g=0.95, rho_h=0.95, sd_g=0.005, sd_h_ratio=1.0)
         self.memory_target = memory_target or MemoryTargetDefinition()
@@ -644,7 +651,27 @@ class DetectorService:
     def set_auto_rollback(self, enabled: bool) -> bool:
         """Toggle opt-in automated simulated rollback (operational demo mode)."""
         self.enable_auto_rollback = bool(enabled)
+        if self.enable_auto_rollback and not self.frozen_policy.is_calibrated:
+            # If default exploratory policy is active, elevate to calibrated policy to permit safe intervention
+            if self.frozen_policy.calibration_status == "UNVALIDATED_EXPLORATORY" and self.frozen_policy.policy_id == "POLICY-SIDAK-0.05":
+                self.frozen_policy = create_calibrated_hier_policy()
+                self.policy = MultiChannelAlertPolicy(
+                    threshold_lat=self.frozen_policy.threshold_lat,
+                    threshold_mem=self.frozen_policy.threshold_mem,
+                    require_persistence=self.frozen_policy.require_persistence,
+                    alpha=self.frozen_policy.alpha,
+                )
         return self.enable_auto_rollback
+
+    def set_policy(self, policy: FrozenPolicy) -> None:
+        """Set active policy, updating decision thresholds and calibration status."""
+        self.frozen_policy = policy
+        self.policy = MultiChannelAlertPolicy(
+            threshold_lat=self.frozen_policy.threshold_lat,
+            threshold_mem=self.frozen_policy.threshold_mem,
+            require_persistence=self.frozen_policy.require_persistence,
+            alpha=self.frozen_policy.alpha,
+        )
 
     def set_deployment(self, release_id: str, canary_ids: list[str], t0: int) -> None:
         """Notify detector service of an active canary deployment at tick t0.
@@ -910,8 +937,15 @@ class DetectorService:
         )
 
         # Check automated simulated rollback (Opt-in operational mode)
+        # Requirement: Disallow auto-rollback under exploratory/uncalibrated policies!
         auto_rollback_now = False
-        if self.enable_auto_rollback and policy_eval["is_alert"] and not self.auto_rollback_triggered:
+        is_policy_calibrated = getattr(self.frozen_policy, "is_calibrated", False)
+        if (
+            self.enable_auto_rollback
+            and is_policy_calibrated
+            and policy_eval["is_alert"]
+            and not self.auto_rollback_triggered
+        ):
             self.auto_rollback_triggered = True
             self.intervention_tick = decision_tick
             auto_rollback_now = True
@@ -1476,15 +1510,19 @@ class DetectorService:
                     "log_score": round(float(log_probs[i]), 4),
                 })
 
+            is_method_calibrated = (kind == "hier" and getattr(self.frozen_policy, "is_calibrated", False))
+            cal_status = "CALIBRATED" if is_method_calibrated else "DIAGNOSTIC_ONLY"
             return {
                 "name": name,
                 "kind": kind,
                 "description": description,
+                "calibration_status": cal_status,
                 "mean_effect": round(float(np.mean(am)), 5),
                 "mean_effect_pct": round((np.exp(float(np.mean(am))) - 1.0) * 100.0, 2),
                 "release_score": round(score, 4),
                 "release_risk": round(max_risk, 4),
-                "alert": bool(score > self.frozen_policy.threshold_lat),
+                "alert": bool(score > self.frozen_policy.threshold_lat) if is_method_calibrated else False,
+                "diagnostic_alert": bool(score > self.frozen_policy.threshold_lat),
                 "hosts": hosts,
             }
 

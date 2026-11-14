@@ -74,6 +74,25 @@ class FaultEngine:
         self.registered_faults.append(fault)
         self.truth_store.register_fault(fault)
 
+    def terminate_release_faults(self, release_id: str, current_tick: int) -> list[str]:
+        """Terminate / expire any active or scheduled faults targeting release_id."""
+        import dataclasses
+        terminated = []
+        new_faults = []
+        for f in self.registered_faults:
+            if (
+                f.target_id == release_id
+                or (f.target_version and release_id in str(f.target_version))
+                or f.fault_id.startswith(f"fault-{release_id}")
+            ):
+                new_f = dataclasses.replace(f, duration=max(0, current_tick - f.onset_tick))
+                new_faults.append(new_f)
+                terminated.append(f.fault_id)
+            else:
+                new_faults.append(f)
+        self.registered_faults = new_faults
+        return terminated
+
     def reset(self, seed: int | None = None) -> None:
         """Reset internal fault state and RNGs."""
         active_seed = self.seed if seed is None else int(seed)
@@ -219,10 +238,29 @@ class FaultEngine:
             # 4. CPU Saturation
             elif f.fault_type == FaultType.CPU_SATURATION:
                 target_servers: list[str] = []
-                if f.scope == FaultScope.SERVER:
-                    target_servers = [f.target_id] if f.target_id in deltas else []
+                if f.scope == FaultScope.SERVER and f.target_id in deltas:
+                    target_servers = [f.target_id]
+                elif f.parameters and "target_server_ids" in f.parameters:
+                    target_servers = [sid for sid in f.parameters["target_server_ids"] if sid in deltas]
+                elif f.target_id in ("canaries", "canary"):
+                    target_servers = [
+                        s.server_id for s in fleet.list_servers()
+                        if s.installed_version != "v1.0.0-baseline" and s.server_id in deltas
+                    ]
+                elif f.target_version:
+                    # Version-scoped CPU regression
+                    target_servers = [
+                        s.server_id for s in fleet.list_servers()
+                        if s.installed_version == f.target_version
+                        and (f.susceptible_class_id is None or s.class_id == f.susceptible_class_id)
+                    ]
                 elif f.scope == FaultScope.RACK:
                     target_servers = [s.server_id for s in fleet.list_servers() if s.rack_id == f.target_id]
+                elif f.scope == FaultScope.FLEET:
+                    target_servers = list(deltas.keys())
+
+                if f.target_version:
+                    target_servers = [sid for sid in target_servers if fleet.get_server(sid) and fleet.get_server(sid).installed_version == f.target_version]
 
                 for sid in target_servers:
                     deltas[sid]["cpu_saturation_delta"] += f.severity

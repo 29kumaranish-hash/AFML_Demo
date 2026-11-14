@@ -76,6 +76,12 @@ class SimulatorService:
         self.active_canary_ids: list[str] = []
         self.last_rollback_status: dict[str, Any] | None = None
 
+        # Scenario and replay state
+        self.missingness_rate: float = 0.0
+        self.drop_same_rack_controls: bool = False
+        self.rng_miss: np.random.Generator = np.random.default_rng(seed)
+        self.is_read_only_replay: bool = False
+
         # Initialize decoupled DetectorService
         server_meta = {
             srv.server_id: {
@@ -119,6 +125,8 @@ class SimulatorService:
 
     def step(self, n_ticks: int = 1) -> dict[str, Any]:
         with self.lock:
+            if self.is_read_only_replay:
+                raise RuntimeError("Cannot advance live simulation during read-only timeline replay.")
             for _ in range(max(1, n_ticks)):
                 # Keep detector service deployment in sync if canaries were modified directly
                 if self.active_canary_ids and set(self.active_canary_ids) != set(self.detector_service.active_canary_ids):
@@ -131,11 +139,24 @@ class SimulatorService:
                     self.detector_service.set_rollback(tick=self.world.clock.tick)
 
                 res = self.world.step(1)
+
+                # Filter telemetry for detector according to scenario missingness / control masking
+                canary_racks = {s.rack_id for s in self.world.fleet.list_servers() if s.server_id in self.active_canary_ids}
+                telemetry_for_detector = []
                 for record in res.telemetry:
                     self.telemetry_history.append(record)
+                    # Suppress baseline controls in canary racks if drop_same_rack_controls is enabled
+                    if self.drop_same_rack_controls and not record.exposure:
+                        srv = self.world.fleet.get_server(record.server_id)
+                        if srv and srv.rack_id in canary_racks:
+                            continue
+                    # Stochastic missingness drop
+                    if self.missingness_rate > 0.0 and self.rng_miss.random() < self.missingness_rate:
+                        continue
+                    telemetry_for_detector.append(record)
 
-                # Feed telemetry to decoupled detector service
-                self.detector_service.ingest(res.telemetry)
+                # Feed filtered telemetry to decoupled detector service
+                self.detector_service.ingest(telemetry_for_detector)
                 det_res = self.detector_service.step(res.tick)
 
                 # Check opt-in automatic rollback (operational demo mode)
@@ -170,6 +191,10 @@ class SimulatorService:
             self.active_release_id = None
             self.active_canary_ids.clear()
             self.last_rollback_status = None
+            self.missingness_rate = 0.0
+            self.drop_same_rack_controls = False
+            self.rng_miss = np.random.default_rng(new_seed)
+            self.is_read_only_replay = False
 
             server_meta = {
                 srv.server_id: {
@@ -297,14 +322,22 @@ class SimulatorService:
     def import_run(self, bundle: dict[str, Any]) -> dict[str, Any]:
         with self.lock:
             self.pause()
+            self.is_read_only_replay = True
+            if "current_tick" in bundle:
+                self.world.clock.tick = int(bundle["current_tick"])
             records_raw = bundle.get("telemetry_history", [])
             timeline_raw = bundle.get("timeline_summary", [])
             self.tick_metrics_summary = list(timeline_raw)
             self.telemetry_history.clear()
             for r in records_raw:
                 self.telemetry_history.append(TelemetryRecord.from_dict(r))
+            if "command_history" in bundle and hasattr(self.deployment_mgr, "deployment_history"):
+                self.deployment_mgr.deployment_history.clear()
+                self.deployment_mgr.deployment_history.extend(bundle["command_history"])
             return {
                 "status": "LOADED",
+                "is_read_only_replay": True,
+                "current_tick": self.world.clock.tick,
                 "total_records": len(self.telemetry_history),
                 "total_ticks": len(self.tick_metrics_summary),
             }
@@ -404,6 +437,32 @@ class SimulatorService:
             if self.active_release_id == release_id:
                 self.active_release_id = None
                 self.active_canary_ids.clear()
+            return res
+
+    def pause_canary(
+        self,
+        release_id: str,
+        reason: str = "Operator paused rollout",
+    ) -> dict[str, Any]:
+        with self.lock:
+            res = self.deployment_mgr.pause_canary(
+                release_id=release_id,
+                current_tick=self.world.clock.tick,
+                reason=reason,
+            )
+            return res
+
+    def promote_canary(
+        self,
+        release_id: str,
+        reason: str = "Operator promoted rollout",
+    ) -> dict[str, Any]:
+        with self.lock:
+            res = self.deployment_mgr.promote_canary(
+                world=self.world,
+                release_id=release_id,
+                reason=reason,
+            )
             return res
 
     # -----------------------------------------------------------------
@@ -614,17 +673,28 @@ class SimulatorService:
             # 1. Reset world with scenario seed
             self.reset(seed=scen.seed)
 
-            # 2. Step through warmup if not already warmed up
+            # 2. Configure telemetry dynamics (GC cycles, workload)
+            if scen.workload.has_gc_cycles:
+                self.world.telemetry_engine.cfg.gc_amplitude_mb = scen.workload.gc_amplitude_mb
+                self.world.telemetry_engine.cfg.gc_period_ticks = scen.workload.gc_period_ticks
+            else:
+                self.world.telemetry_engine.cfg.gc_amplitude_mb = 0.0
+
+            # 3. Configure scenario observation drops / missingness
+            self.missingness_rate = scen.injection.missingness_rate
+            self.drop_same_rack_controls = scen.injection.drop_same_rack_controls
+
+            # 4. Step through warmup if not already warmed up
             warmup = max(1, scen.warmup_ticks)
             current_tick = self.world.clock.tick
             if current_tick < warmup:
                 self.step(warmup - current_tick)
 
-            # 3. Create release matching scenario
+            # 5. Create release matching scenario
             profile_dict = {
                 "profile_type": scen.deployment.profile_type,
-                "latency_multiplier": 1.15 if scen.deployment.profile_type in ("SUBTLE_REGRESSION", "SEVERE_REGRESSION", "LATENCY_REGRESSION") else 1.0,
-                "memory_leak_rate_mb_per_min": 1.5 if scen.deployment.profile_type == "MEMORY_LEAK" else 0.0,
+                "severity": 35.0 if scen.deployment.profile_type == "MEMORY_LEAK" else (0.40 if scen.deployment.profile_type == "CPU_REGRESSION" else (0.15 if scen.deployment.profile_type in ("SUBTLE_REGRESSION", "SEVERE_REGRESSION", "LATENCY_REGRESSION") else 0.0)),
+                "duration": scen.horizon_ticks,
             }
             rel = self.create_release(
                 release_id=scen.deployment.release_id,
@@ -633,17 +703,20 @@ class SimulatorService:
                 metadata={"scenario": name, "affected_canaries": scen.deployment.affected_canary_ids},
             )
 
-            # 4. Deploy canary
+            # 6. Deploy canary
             deploy_res = self.deploy_canary(
                 release_id=scen.deployment.release_id,
                 canary_server_ids=scen.deployment.canary_ids,
             )
 
-            # 5. Inject scenario fault if defined
+            # 7. Inject scenario fault if defined
             fault_res = None
             if scen.injection.fault_type:
-                target_str = str(scen.injection.target_scope or scen.deployment.canary_ids[0])
-                targets = [s.strip() for s in target_str.split(",")]
+                target_str = str(scen.injection.target_scope or (scen.deployment.canary_ids[0] if scen.deployment.canary_ids else "fleet"))
+                if target_str.lower() in ("canaries", "canary"):
+                    targets = list(scen.deployment.canary_ids)
+                else:
+                    targets = [s.strip() for s in target_str.split(",")]
                 fault_results = []
                 for t_id in targets:
                     scope = "RACK" if "rack" in t_id.lower() else ("FLEET" if "fleet" in t_id.lower() else "SERVER")

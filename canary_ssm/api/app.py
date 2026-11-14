@@ -19,12 +19,17 @@ def create_app(service: SimulatorService | None = None) -> FastAPI:
         description="Hierarchical SSM Canary Regression Detection & Virtual Data Center Simulator",
     )
 
-    # Enable CORS
+    # Safe localhost-restricted CORS defaults
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=["*"],
+        allow_origins=[
+            "http://localhost:8000",
+            "http://127.0.0.1:8000",
+            "http://localhost:3000",
+            "http://127.0.0.1:3000",
+        ],
         allow_credentials=True,
-        allow_methods=["*"],
+        allow_methods=["GET", "POST", "OPTIONS"],
         allow_headers=["*"],
     )
 

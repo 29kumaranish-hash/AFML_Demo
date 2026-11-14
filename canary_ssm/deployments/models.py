@@ -26,6 +26,27 @@ class BehaviorProfileType(str, Enum):
     LATENCY_REGRESSION = "LATENCY_REGRESSION"
 
 
+class RolloutState(str, Enum):
+    """Validated lifecycle states for canary rollouts."""
+    CREATED = "CREATED"
+    BASELINING = "BASELINING"
+    CANARY = "CANARY"
+    PAUSED = "PAUSED"
+    PROMOTED = "PROMOTED"
+    ROLLED_BACK = "ROLLED_BACK"
+    FAILED = "FAILED"
+
+
+@dataclass(frozen=True)
+class RolloutTransition:
+    """Append-only audit log record of rollout state transitions."""
+    release_id: str
+    from_state: RolloutState
+    to_state: RolloutState
+    tick: int
+    reason: str
+
+
 @dataclass(frozen=True)
 class BehaviorProfile:
     """Declared simulation behavior associated with a versioned release.
@@ -39,6 +60,15 @@ class BehaviorProfile:
     duration: int = 120                 # Active duration in simulation ticks (minutes)
     susceptible_class_id: int | None = None  # Optional compatibility class restriction
     parameters: dict[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        import math
+        if math.isnan(self.severity) or math.isinf(self.severity):
+            raise ValueError(f"BehaviorProfile severity must be a finite number, got {self.severity}")
+        if self.duration < 0:
+            raise ValueError(f"BehaviorProfile duration must be non-negative, got {self.duration}")
+        if self.susceptible_class_id is not None and self.susceptible_class_id < 0:
+            raise ValueError(f"susceptible_class_id must be non-negative, got {self.susceptible_class_id}")
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -132,6 +162,9 @@ class Release:
     release_id: str
     version_tag: str
     behavior_profile: BehaviorProfile
+    service_id: str = "default-service"
+    schema_version: str = "v1.0"
+    rollout_state: RolloutState = RolloutState.CREATED
     artifact: ReleaseArtifact | None = None
     created_at_tick: int = 0
     metadata: dict[str, Any] = field(default_factory=dict)
@@ -146,6 +179,9 @@ class Release:
         return {
             "release_id": self.release_id,
             "version_tag": self.version_tag,
+            "service_id": self.service_id,
+            "schema_version": self.schema_version,
+            "rollout_state": self.rollout_state.value,
             "behavior_profile": self.behavior_profile.to_dict(),
             "artifact": self.artifact.to_dict() if self.artifact else None,
             "created_at_tick": self.created_at_tick,
@@ -156,10 +192,14 @@ class Release:
     def from_dict(cls, d: dict[str, Any]) -> "Release":
         art = ReleaseArtifact.from_dict(d["artifact"]) if d.get("artifact") else None
         prof = BehaviorProfile.from_dict(d["behavior_profile"])
+        state = RolloutState(d["rollout_state"]) if d.get("rollout_state") else RolloutState.CREATED
         return cls(
             release_id=str(d["release_id"]),
             version_tag=str(d["version_tag"]),
             behavior_profile=prof,
+            service_id=str(d.get("service_id", "default-service")),
+            schema_version=str(d.get("schema_version", "v1.0")),
+            rollout_state=state,
             artifact=art,
             created_at_tick=int(d.get("created_at_tick", 0)),
             metadata=dict(d.get("metadata", {})),

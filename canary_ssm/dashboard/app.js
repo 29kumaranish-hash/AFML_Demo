@@ -29,6 +29,19 @@ document.addEventListener("DOMContentLoaded", () => {
 });
 
 // ---------------------------------------------------------------------
+// HTML Escaping Utility for XSS Prevention
+// ---------------------------------------------------------------------
+function escapeHtml(str) {
+  if (str === null || str === undefined) return '';
+  return String(str)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
+// ---------------------------------------------------------------------
 // Toast Notifications
 // ---------------------------------------------------------------------
 function showToast(message, type = "info") {
@@ -131,7 +144,7 @@ function setupQuickStart() {
   async function startDemoScenario() {
     const selected = selectPreset ? selectPreset.value : "release_memory_leak";
     showToast(`Loading scenario preset: ${selected}...`, "info");
-    const res = await apiPost("/api/scenarios/load", { scenario_name: selected });
+    const res = await apiPost("/api/scenarios/load", { name: selected, scenario_name: selected });
     if (!res) return;
 
     await apiPost("/api/world/control", { action: "start" });
@@ -181,15 +194,15 @@ async function loadPresetsCatalog() {
       const catBadge = scen.profile_type === "CLEAN" ? "badge-version" : "badge-canary";
       card.innerHTML = `
         <div class="preset-header">
-          <span class="preset-title">${scen.name.replace(/_/g, " ")}</span>
-          <span class="badge ${catBadge}">${scen.profile_type}</span>
+          <span class="preset-title">${escapeHtml(scen.name.replace(/_/g, " "))}</span>
+          <span class="badge ${catBadge}">${escapeHtml(scen.profile_type)}</span>
         </div>
-        <p class="preset-desc">${scen.description}</p>
+        <p class="preset-desc">${escapeHtml(scen.description)}</p>
         <div class="preset-meta">
-          Seed: ${scen.seed} &bull; Warmup: ${scen.warmup_ticks}m &bull; Horizon: ${scen.horizon_ticks}m &bull; Canaries: ${scen.canary_ids.length}
+          Seed: ${Number(scen.seed)} &bull; Warmup: ${Number(scen.warmup_ticks)}m &bull; Horizon: ${Number(scen.horizon_ticks)}m &bull; Canaries: ${Array.isArray(scen.canary_ids) ? scen.canary_ids.length : 0}
         </div>
         <div style="margin-top: auto;">
-          <button class="btn btn-primary btn-run-preset" style="width: 100%; font-size: 0.8rem;" data-name="${scen.name}">
+          <button class="btn btn-primary btn-run-preset" style="width: 100%; font-size: 0.8rem;" data-name="${escapeHtml(scen.name)}">
             ▶ Run Scenario
           </button>
         </div>
@@ -202,7 +215,7 @@ async function loadPresetsCatalog() {
         const sName = btn.dataset.name;
         if (selectPreset) selectPreset.value = sName;
         showToast(`Loading preset "${sName}"...`, "info");
-        const res = await apiPost("/api/scenarios/load", { scenario_name: sName });
+        const res = await apiPost("/api/scenarios/load", { name: sName, scenario_name: sName });
         if (res) {
           await apiPost("/api/world/control", { action: "start" });
           showToast(`Scenario "${sName}" running! Navigating to Monitoring...`, "success");
@@ -467,7 +480,7 @@ async function showServerModal(srv) {
   const serverEvidence = (evidenceRes && evidenceRes.servers) ? evidenceRes.servers[srv.server_id] : null;
 
   if (title) {
-    title.innerHTML = `<span>Server Inspection: <strong>${srv.server_id}</strong></span> <span class="badge ${isCanary ? 'badge-canary' : 'badge-version'}">${isCanary ? 'CANARY HOST' : 'BASELINE CONTROL'}</span>`;
+    title.innerHTML = `<span>Server Inspection: <strong>${escapeHtml(srv.server_id)}</strong></span> <span class="badge ${isCanary ? 'badge-canary' : 'badge-version'}">${isCanary ? 'CANARY HOST' : 'BASELINE CONTROL'}</span>`;
   }
 
   let detectorSection = "";
@@ -488,7 +501,7 @@ async function showServerModal(srv) {
           <div>Latency Effect (a_hat): <strong>${latEff}</strong></div>
           <div>95% Credible Interval: <strong>${ciStr}</strong></div>
           <div>Harm Risk Pr(a_i > log(1.02)): <strong style="color: ${(serverEvidence.host_risk || 0) > 0.5 ? 'var(--accent-red)' : 'var(--text-primary)'}">${hostRisk}</strong></div>
-          <div>Guardrail Status: <span class="badge ${serverEvidence.guardrail_status === 'NORMAL' ? 'badge-version' : 'badge-warning'}">${serverEvidence.guardrail_status}</span></div>
+          <div>Guardrail Status: <span class="badge ${serverEvidence.guardrail_status === 'NORMAL' ? 'badge-version' : 'badge-warning'}">${escapeHtml(serverEvidence.guardrail_status)}</span></div>
           <div>Memory Drift Rate: <strong>${memRate}</strong></div>
           <div>Capacity Headroom: <strong>${headroom}</strong></div>
           <div>Time-To-Exhaustion (TTE): <strong>${tte}</strong></div>
@@ -501,7 +514,7 @@ async function showServerModal(srv) {
       <div style="background: var(--bg-primary); padding: 1rem; border-radius: 6px; margin-top: 1rem; border: 1px solid var(--accent-blue);">
         <h4 style="color: var(--accent-blue); margin-bottom: 0.5rem; font-size: 0.9rem;">Baseline Control Alignment</h4>
         <p style="font-size: 0.8rem; color: var(--text-secondary);">
-          This instance serves as an unexposed concurrent control for Rack ${srv.rack_id} and Class ${srv.class_id}.
+          This instance serves as an unexposed concurrent control for Rack ${escapeHtml(srv.rack_id)} and Class ${Number(srv.class_id)}.
           Used for nested SVD fleet factor and rack nuisance removal with uncertainty propagation.
         </p>
       </div>
@@ -510,14 +523,14 @@ async function showServerModal(srv) {
 
   body.innerHTML = `
     <div class="grid-2" style="font-size: 0.85rem; margin-bottom: 0.5rem; gap: 0.5rem;">
-      <div><strong>Rack ID:</strong> ${srv.rack_id}</div>
-      <div><strong>Class:</strong> Class ${srv.class_id} (${srv.cpu_cores} Cores, ${srv.memory_capacity_mb}MB RAM)</div>
-      <div><strong>Installed Version:</strong> <code>${srv.installed_version}</code></div>
+      <div><strong>Rack ID:</strong> ${escapeHtml(srv.rack_id)}</div>
+      <div><strong>Class:</strong> Class ${Number(srv.class_id)} (${Number(srv.cpu_cores)} Cores, ${Number(srv.memory_capacity_mb)}MB RAM)</div>
+      <div><strong>Installed Version:</strong> <code>${escapeHtml(srv.installed_version)}</code></div>
       <div><strong>Online State:</strong> <span class="status-dot ${srv.online ? 'dot-online' : 'dot-offline'}"></span> ${srv.online ? 'Online' : 'Offline'}</div>
       <div><strong>Measured Latency:</strong> ${(st.latency_ms || srv.base_latency_ms).toFixed(2)} ms</div>
       <div><strong>Process Memory:</strong> ${(st.memory_mb || srv.base_memory_mb).toFixed(1)} MB (${Math.round(((st.memory_mb || srv.base_memory_mb) / srv.memory_capacity_mb) * 100)}%)</div>
       <div><strong>CPU Utilization:</strong> ${Math.round((st.cpu_fraction || 0) * 100)}%</div>
-      <div><strong>Traffic & Errors:</strong> ${st.request_count || 0} req/min &bull; ${st.error_count || 0} errors</div>
+      <div><strong>Traffic & Errors:</strong> ${Number(st.request_count || 0)} req/min &bull; ${Number(st.error_count || 0)} errors</div>
     </div>
     ${detectorSection}
   `;
@@ -579,11 +592,23 @@ function setupReleasesPage() {
   });
 
   // File Upload SHA-256 calculation (Unexecuted artifact)
+  let selectedArtifactBytes = null;
+  let selectedArtifactFileName = null;
+
   const fileUpload = document.getElementById("rel-artifact-upload");
   fileUpload?.addEventListener("change", async (e) => {
     const file = e.target.files[0];
-    if (!file) return;
+    if (!file) {
+      selectedArtifactBytes = null;
+      selectedArtifactFileName = null;
+      const fileInput = document.getElementById("rel-artifact-file");
+      if (fileInput) fileInput.value = "";
+      const hashDisplay = document.getElementById("artifact-hash-display");
+      if (hashDisplay) hashDisplay.textContent = "";
+      return;
+    }
 
+    selectedArtifactFileName = file.name;
     const fileInput = document.getElementById("rel-artifact-file");
     if (fileInput) fileInput.value = file.name;
 
@@ -595,6 +620,8 @@ function setupReleasesPage() {
       const hashBuffer = await crypto.subtle.digest("SHA-256", arrayBuffer);
       const hashArray = Array.from(new Uint8Array(hashBuffer));
       const hashHex = hashArray.map(b => b.toString(16).padStart(2, "0")).join("");
+
+      selectedArtifactBytes = await file.text();
 
       if (hashDisplay) {
         hashDisplay.textContent = `SHA-256: ${hashHex} (${(file.size / 1024).toFixed(1)} KB - UNEXECUTED)`;
@@ -616,8 +643,8 @@ function setupReleasesPage() {
     const classIdVal = document.getElementById("rel-class-filter").value;
     const susceptibleClass = classIdVal === "all" ? null : parseInt(classIdVal, 10);
 
-    const artifactName = document.getElementById("rel-artifact-file").value.trim() || "service_code.py";
-    const artifactContent = `# Source build artifact for ${versionTag}\nVERSION = '${versionTag}'\n`;
+    const artifactName = selectedArtifactFileName || null;
+    const artifactContent = selectedArtifactBytes || null;
 
     const body = {
       release_id: releaseId,
@@ -824,13 +851,13 @@ async function renderReleasesList() {
     const art = r.artifact || {};
 
     row.innerHTML = `
-      <td><strong>${r.release_id}</strong></td>
-      <td><span class="badge badge-version">${r.version_tag}</span></td>
-      <td><span class="badge badge-canary">${p.profile_type}</span> (sev=${p.severity})</td>
+      <td><strong>${escapeHtml(r.release_id)}</strong></td>
+      <td><span class="badge badge-version">${escapeHtml(r.version_tag)}</span></td>
+      <td><span class="badge badge-canary">${escapeHtml(p.profile_type)}</span> (sev=${Number(p.severity)})</td>
       <td>
-        ${art.artifact_filename ? `<code>${art.artifact_filename}</code> <span class="badge badge-warning">UNEXECUTED</span>` : 'None'}
+        ${art.artifact_filename ? `<code>${escapeHtml(art.artifact_filename)}</code> <span class="badge badge-warning">UNEXECUTED</span>` : 'None'}
       </td>
-      <td>${r.created_at_tick} min</td>
+      <td>${Number(r.created_at_tick)} min</td>
     `;
     tableBody.appendChild(row);
 
@@ -858,10 +885,10 @@ async function renderCommandHistory() {
   history.slice().reverse().forEach(cmd => {
     const row = document.createElement("tr");
     row.innerHTML = `
-      <td><code>${cmd.command_id}</code></td>
-      <td><strong>${cmd.action}</strong></td>
-      <td>T=${cmd.tick}</td>
-      <td><span class="badge ${cmd.status === 'DEPLOYED' || cmd.action === 'CREATE_RELEASE' ? 'badge-canary' : 'badge-warning'}">${cmd.status || 'OK'}</span></td>
+      <td><code>${escapeHtml(cmd.command_id)}</code></td>
+      <td><strong>${escapeHtml(cmd.action)}</strong></td>
+      <td>T=${Number(cmd.tick)}</td>
+      <td><span class="badge ${cmd.status === 'DEPLOYED' || cmd.action === 'CREATE_RELEASE' ? 'badge-canary' : 'badge-warning'}">${escapeHtml(cmd.status || 'OK')}</span></td>
     `;
     tableBody.appendChild(row);
   });
@@ -931,11 +958,11 @@ async function renderFaultTruth() {
   faults.forEach(f => {
     const row = document.createElement("tr");
     row.innerHTML = `
-      <td><code>${f.fault_id}</code></td>
-      <td><span class="badge ${f.category === 'release' || f.category === 'RELEASE' ? 'badge-canary' : 'badge-warning'}">${f.fault_type}</span></td>
-      <td>${f.scope}: <b>${f.target_id}</b></td>
-      <td>T=${f.onset_tick} to T=${f.onset_tick + f.duration} (${f.duration}m)</td>
-      <td>${f.severity}</td>
+      <td><code>${escapeHtml(f.fault_id)}</code></td>
+      <td><span class="badge ${f.category === 'release' || f.category === 'RELEASE' ? 'badge-canary' : 'badge-warning'}">${escapeHtml(f.fault_type)}</span></td>
+      <td>${escapeHtml(f.scope)}: <b>${escapeHtml(f.target_id)}</b></td>
+      <td>T=${Number(f.onset_tick)} to T=${Number(f.onset_tick) + Number(f.duration)} (${Number(f.duration)}m)</td>
+      <td>${Number(f.severity)}</td>
       <td>${f.is_active ? '<b style="color:var(--accent-red)">ACTIVE</b>' : '<span style="color:var(--text-muted)">Scheduled / Expired</span>'}</td>
     `;
     container.appendChild(row);

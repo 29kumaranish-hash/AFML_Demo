@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from typing import Any
 from fastapi import APIRouter, HTTPException, Query
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 from .service import SimulatorService
 
@@ -58,6 +58,16 @@ class RollbackCanaryRequest(BaseModel):
     restart_process: bool = True
 
 
+class PauseCanaryRequest(BaseModel):
+    release_id: str
+    reason: str = "Operator paused rollout"
+
+
+class PromoteCanaryRequest(BaseModel):
+    release_id: str
+    reason: str = "Operator promoted rollout"
+
+
 class InjectFaultRequest(BaseModel):
     fault_type: str
     scope: str
@@ -90,7 +100,16 @@ class ImportRunRequest(BaseModel):
 
 
 class LoadScenarioRequest(BaseModel):
-    name: str = Field(..., description="Canonical scenario name from catalog")
+    name: str | None = Field(None, description="Canonical scenario name from catalog")
+    scenario_name: str | None = Field(None, description="Alias for scenario name")
+
+    @model_validator(mode="after")
+    def resolve_name(self) -> LoadScenarioRequest:
+        if not self.name and not self.scenario_name:
+            raise ValueError("Either 'name' or 'scenario_name' must be provided")
+        if not self.name:
+            self.name = self.scenario_name
+        return self
 
 
 # ---------------------------------------------------------------------
@@ -179,6 +198,28 @@ def rollback_canary(req: RollbackCanaryRequest) -> dict[str, Any]:
         return get_service().rollback_canary(
             release_id=req.release_id,
             restart_process=req.restart_process,
+        )
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@router.post("/releases/pause")
+def pause_canary(req: PauseCanaryRequest) -> dict[str, Any]:
+    try:
+        return get_service().pause_canary(
+            release_id=req.release_id,
+            reason=req.reason,
+        )
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@router.post("/releases/promote")
+def promote_canary(req: PromoteCanaryRequest) -> dict[str, Any]:
+    try:
+        return get_service().promote_canary(
+            release_id=req.release_id,
+            reason=req.reason,
         )
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))

@@ -1,8 +1,8 @@
 # Virtual Data Center & Canary Detection: Implementation Status & Audit
 
-**Document Version:** 2.2.0 (Correctness Audit, Inference Parity, Policy Validation, 7-Step Dashboard & Method Comparison Complete)  
-**Date:** 2026-11-14  
-**Status:** COMPLETE — Full investigation and resolution of 7 audit findings.
+**Document Version:** 2.3.0 (Comprehensive Repair Audit, 21 Defect Resolutions, Full Canary Rollout Lifecycle & Verification Complete)  
+**Date:** 2026-11-15  
+**Status:** COMPLETE — Full investigation and resolution of all 21 identified defects (258+ tests passing).
 1. **Calibrated vs Exploratory Policies:** Explicit `FrozenPolicy` metadata (`is_calibrated: bool`, `calibration_status`, `threshold_scale`), factory `create_calibrated_hier_policy(threshold_lat=-1.14122, threshold_mem=-0.67302, ...)` matching `table_null_validation.csv`, and strict policy compatibility validation (`validate_policy_compatibility`).
 2. **Inference Parity:** Bit-for-bit numerical parity ($< 10^{-12}$) between batch `EffectDetector.run` and streaming `OnlineHierarchicalLatencyFilter.step` via pre-period noise conditioning and Joseph-form Kalman updates across `hier`, `indep`, and `pooled` models (`tests/test_inference_parity.py`).
 3. **Posterior Risk Presentation:** Clear labeling as **"Release score: maximum host risk"** ($\max_i \log P(a_i > \log(1.02))$), log-scale boundary $\kappa_{\text{lat}} = \log(1.02) \approx +2.0\%$ shift, percentage credible intervals, and initial null score handling (set to `None`, avoiding misleading `0.0`).

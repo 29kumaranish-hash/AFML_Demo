@@ -1,6 +1,6 @@
 # canary_ssm: Hierarchical Canary State-Space Model & Virtual Data Center
 
-[![Tests](https://img.shields.io/badge/tests-248%2B%20passed-brightgreen.svg)]()
+[![Tests](https://img.shields.io/badge/tests-258%2B%20passed-brightgreen.svg)]()
 [![Python](https://img.shields.io/badge/python-3.10%20%7C%203.11%20%7C%203.12-blue.svg)]()
 [![License](https://img.shields.io/badge/license-MIT-green.svg)]()
 
@@ -55,7 +55,7 @@ pip install -e ".[dev,report]"
 
 ### Running the Test Suite
 ```bash
-# Run all fast tests (248+ tests):
+# Run all fast tests (258+ tests):
 python -m pytest -m "not slow" -q
 
 # Run inference parity and policy validation regression suites:

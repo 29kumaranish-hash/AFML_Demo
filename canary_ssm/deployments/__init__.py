@@ -15,6 +15,8 @@ from .models import (
     Release,
     ReleaseArtifact,
     ReleaseRegistry,
+    RolloutState,
+    RolloutTransition,
 )
 from .samples import get_sample_manifest, write_sample_manifests
 
@@ -28,6 +30,8 @@ __all__ = [
     "Release",
     "ReleaseArtifact",
     "ReleaseRegistry",
+    "RolloutState",
+    "RolloutTransition",
     "generate_default_allocation",
     "get_sample_manifest",
     "validate_canary_allocation",
