@@ -30,6 +30,7 @@ from canary_ssm.deployments import (
 )
 from canary_ssm.detector_service import DetectorService, DetectorTickResult
 from canary_ssm.faults.models import FaultCategory, FaultDefinition, FaultScope, FaultType
+from canary_ssm.scenarios.catalog import create_scenario_catalog
 from canary_ssm.telemetry import TelemetryRecord
 from canary_ssm.world import VirtualWorld, create_default_fleet
 from canary_ssm.world.models import Fleet, Server
@@ -43,7 +44,7 @@ class SimulatorService:
         n_racks: int = 4,
         servers_per_rack: int = 6,
         seed: int = 42,
-        ssm_connected: bool = False,
+        ssm_connected: bool = True,
     ) -> None:
         self.lock = threading.RLock()
         self.n_racks = n_racks
@@ -224,12 +225,18 @@ class SimulatorService:
                 "canary_servers": list(self.active_canary_ids),
                 "infrastructure_advisory": adv["infrastructure_advisory"],
                 "canary_release_advisory": adv["canary_release_advisory"],
+                "monitoring_state": adv.get("monitoring_state", "MONITORING"),
+                "calibration_status": adv.get("calibration_status", "CALIBRATED"),
+                "is_calibrated": adv.get("is_calibrated", False),
+                "threshold_scale": adv.get("threshold_scale", "LOG_POSTERIOR_RISK"),
                 "advisory_reason": adv["advisory_reason"],
                 "ssm_connected": self.ssm_connected,
                 "model_id": adv.get("model_id"),
                 "policy_id": adv.get("policy_id"),
                 "release_score": adv.get("release_score"),
+                "release_score_prob": adv.get("release_score_prob"),
                 "alert_threshold": adv.get("alert_threshold"),
+                "threshold_lat_prob": adv.get("threshold_lat_prob"),
                 "first_alert_tick": adv.get("first_alert_tick"),
                 "data_eligibility": adv.get("data_eligibility"),
                 "auto_rollback_enabled": adv.get("auto_rollback_enabled"),
@@ -420,15 +427,18 @@ class SimulatorService:
             fid = f"manual-{fault_type.lower()}-{target_id}-{onset}"
 
             # Resolve fault_type and scope case-insensitively
+            scope_str = scope.lower()
+            if scope_str == "host":
+                scope_str = "server"
             try:
                 ft = FaultType(fault_type.lower())
             except ValueError:
                 ft = FaultType[fault_type.upper()]
 
             try:
-                sc = FaultScope(scope.lower())
+                sc = FaultScope(scope_str)
             except ValueError:
-                sc = FaultScope[scope.upper()]
+                sc = FaultScope[scope_str.upper()]
 
             fdef = FaultDefinition(
                 fault_id=fid,
@@ -529,8 +539,14 @@ class SimulatorService:
         return {
             "infrastructure_advisory": det_status["infrastructure_advisory"],
             "canary_release_advisory": det_status["canary_release_advisory"],
+            "monitoring_state": det_status.get("monitoring_state", "MONITORING"),
+            "calibration_status": det_status.get("calibration_status", "CALIBRATED"),
+            "is_calibrated": det_status.get("is_calibrated", False),
+            "threshold_scale": det_status.get("threshold_scale", "LOG_POSTERIOR_RISK"),
             "release_score": det_status["release_score"],
+            "release_score_prob": det_status.get("release_score_prob"),
             "alert_threshold": det_status["threshold_lat"],
+            "threshold_lat_prob": det_status.get("threshold_lat_prob"),
             "advisory_reason": det_status["advisory_reason"],
             "model_id": det_status["model_id"],
             "policy_id": det_status["policy_id"],
@@ -552,6 +568,10 @@ class SimulatorService:
         with self.lock:
             return self.detector_service.get_evidence()
 
+    def get_comparison_evidence(self) -> dict[str, Any]:
+        with self.lock:
+            return self.detector_service.get_comparison_evidence()
+
     def get_detector_timeline(self, limit: int = 120) -> list[dict[str, Any]]:
         with self.lock:
             return self.detector_service.get_timeline(limit=limit)
@@ -559,3 +579,92 @@ class SimulatorService:
     def set_auto_rollback(self, enabled: bool) -> bool:
         with self.lock:
             return self.detector_service.set_auto_rollback(enabled)
+
+    # -----------------------------------------------------------------
+    # Scenario Catalog & 1-Click Guided Demo Presets
+    # -----------------------------------------------------------------
+    def list_scenarios(self) -> list[dict[str, Any]]:
+        """Return canonical scenario definitions with friendly metadata."""
+        catalog = create_scenario_catalog()
+        result = []
+        for name, scen in catalog.items():
+            result.append({
+                "name": name,
+                "description": scen.description,
+                "seed": scen.seed,
+                "warmup_ticks": scen.warmup_ticks,
+                "horizon_ticks": scen.horizon_ticks,
+                "profile_type": scen.deployment.profile_type,
+                "release_id": scen.deployment.release_id,
+                "canary_ids": scen.deployment.canary_ids,
+                "affected_canary_ids": scen.deployment.affected_canary_ids,
+                "fault_type": scen.injection.fault_type,
+                "severity": scen.injection.severity,
+            })
+        return result
+
+    def load_scenario(self, name: str) -> dict[str, Any]:
+        """Reset and configure the world and deployment for a canonical scenario."""
+        catalog = create_scenario_catalog()
+        if name not in catalog:
+            raise ValueError(f"Unknown scenario '{name}'. Available: {list(catalog.keys())}")
+        scen = catalog[name]
+
+        with self.lock:
+            # 1. Reset world with scenario seed
+            self.reset(seed=scen.seed)
+
+            # 2. Step through warmup if not already warmed up
+            warmup = max(1, scen.warmup_ticks)
+            current_tick = self.world.clock.tick
+            if current_tick < warmup:
+                self.step(warmup - current_tick)
+
+            # 3. Create release matching scenario
+            profile_dict = {
+                "profile_type": scen.deployment.profile_type,
+                "latency_multiplier": 1.15 if scen.deployment.profile_type in ("SUBTLE_REGRESSION", "SEVERE_REGRESSION", "LATENCY_REGRESSION") else 1.0,
+                "memory_leak_rate_mb_per_min": 1.5 if scen.deployment.profile_type == "MEMORY_LEAK" else 0.0,
+            }
+            rel = self.create_release(
+                release_id=scen.deployment.release_id,
+                version_tag=scen.deployment.version,
+                behavior_profile=profile_dict,
+                metadata={"scenario": name, "affected_canaries": scen.deployment.affected_canary_ids},
+            )
+
+            # 4. Deploy canary
+            deploy_res = self.deploy_canary(
+                release_id=scen.deployment.release_id,
+                canary_server_ids=scen.deployment.canary_ids,
+            )
+
+            # 5. Inject scenario fault if defined
+            fault_res = None
+            if scen.injection.fault_type:
+                target_str = str(scen.injection.target_scope or scen.deployment.canary_ids[0])
+                targets = [s.strip() for s in target_str.split(",")]
+                fault_results = []
+                for t_id in targets:
+                    scope = "RACK" if "rack" in t_id.lower() else ("FLEET" if "fleet" in t_id.lower() else "SERVER")
+                    f_res = self.inject_fault(
+                        fault_type=scen.injection.fault_type,
+                        scope=scope,
+                        target_id=t_id,
+                        severity=scen.injection.severity or 1.0,
+                        duration=scen.horizon_ticks or 60,
+                        onset_tick=self.world.clock.tick,
+                        target_version=scen.deployment.version,
+                    )
+                    fault_results.append(f_res)
+                fault_res = fault_results if len(fault_results) > 1 else (fault_results[0] if fault_results else None)
+
+            return {
+                "scenario": name,
+                "description": scen.description,
+                "tick": self.world.clock.tick,
+                "release": rel,
+                "deployment": deploy_res,
+                "fault": fault_res,
+                "status": self.get_status(),
+            }

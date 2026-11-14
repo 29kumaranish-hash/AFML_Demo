@@ -4,7 +4,7 @@
  */
 
 const API_BASE = "";
-let currentTab = "world";
+let currentTab = "overview";
 let pollInterval = null;
 let activeCanarySet = new Set();
 let cachedTimeline = [];
@@ -16,10 +16,12 @@ let currentReplayIndex = 0;
 // Initialize Dashboard
 document.addEventListener("DOMContentLoaded", () => {
   setupNavigation();
+  setupQuickStart();
   setupWorldControls();
   setupReleasesPage();
   setupFaultLabPage();
   setupEvaluationPage();
+  loadPresetsCatalog();
 
   // Initial refresh and periodic polling (every 1s)
   refreshAll();
@@ -119,6 +121,99 @@ async function apiPost(endpoint, body) {
 }
 
 // ---------------------------------------------------------------------
+// Quick Start & Preset Catalog Controller
+// ---------------------------------------------------------------------
+function setupQuickStart() {
+  const startBtn = document.getElementById("btn-start-demo");
+  const heroStartBtn = document.getElementById("btn-hero-start");
+  const selectPreset = document.getElementById("select-demo-preset");
+
+  async function startDemoScenario() {
+    const selected = selectPreset ? selectPreset.value : "release_memory_leak";
+    showToast(`Loading scenario preset: ${selected}...`, "info");
+    const res = await apiPost("/api/scenarios/load", { scenario_name: selected });
+    if (!res) return;
+
+    await apiPost("/api/world/control", { action: "start" });
+    showToast(`Scenario "${selected}" active! Switching to Monitoring.`, "success");
+
+    // Switch to monitoring tab
+    const monTabBtn = document.querySelector(`.tab-btn[data-tab="monitoring"]`);
+    if (monTabBtn) monTabBtn.click();
+  }
+
+  startBtn?.addEventListener("click", startDemoScenario);
+  heroStartBtn?.addEventListener("click", startDemoScenario);
+
+  document.getElementById("btn-demo-preset-info")?.addEventListener("click", () => {
+    const selected = selectPreset ? selectPreset.value : "release_memory_leak";
+    showToast(`Preset "${selected}": pre-conditions, canary allocation, and faults configured.`, "info");
+  });
+
+  document.getElementById("btn-filter-calibrated")?.addEventListener("click", () => {
+    showToast("Calibrated Policy (FAR=0.05, N=2000) active with log-scale thresholds.", "info");
+  });
+}
+
+async function loadPresetsCatalog() {
+  const data = await apiGet("/api/scenarios");
+  if (!data || !Array.isArray(data)) return;
+
+  const selectPreset = document.getElementById("select-demo-preset");
+  const grid = document.getElementById("presets-catalog-grid");
+
+  if (selectPreset) {
+    selectPreset.innerHTML = "";
+    data.forEach(scen => {
+      const opt = document.createElement("option");
+      opt.value = scen.name;
+      opt.textContent = `${scen.name.replace(/_/g, " ").toUpperCase()} (${scen.profile_type})`;
+      if (scen.name === "release_memory_leak") opt.selected = true;
+      selectPreset.appendChild(opt);
+    });
+  }
+
+  if (grid) {
+    grid.innerHTML = "";
+    data.forEach(scen => {
+      const card = document.createElement("div");
+      card.className = "preset-card";
+      const catBadge = scen.profile_type === "CLEAN" ? "badge-version" : "badge-canary";
+      card.innerHTML = `
+        <div class="preset-header">
+          <span class="preset-title">${scen.name.replace(/_/g, " ")}</span>
+          <span class="badge ${catBadge}">${scen.profile_type}</span>
+        </div>
+        <p class="preset-desc">${scen.description}</p>
+        <div class="preset-meta">
+          Seed: ${scen.seed} &bull; Warmup: ${scen.warmup_ticks}m &bull; Horizon: ${scen.horizon_ticks}m &bull; Canaries: ${scen.canary_ids.length}
+        </div>
+        <div style="margin-top: auto;">
+          <button class="btn btn-primary btn-run-preset" style="width: 100%; font-size: 0.8rem;" data-name="${scen.name}">
+            ▶ Run Scenario
+          </button>
+        </div>
+      `;
+      grid.appendChild(card);
+    });
+
+    grid.querySelectorAll(".btn-run-preset").forEach(btn => {
+      btn.addEventListener("click", async () => {
+        const sName = btn.dataset.name;
+        if (selectPreset) selectPreset.value = sName;
+        showToast(`Loading preset "${sName}"...`, "info");
+        const res = await apiPost("/api/scenarios/load", { scenario_name: sName });
+        if (res) {
+          await apiPost("/api/world/control", { action: "start" });
+          showToast(`Scenario "${sName}" running! Navigating to Monitoring...`, "success");
+          document.querySelector(`.tab-btn[data-tab="monitoring"]`)?.click();
+        }
+      });
+    });
+  }
+}
+
+// ---------------------------------------------------------------------
 // Main Poll Loop
 // ---------------------------------------------------------------------
 async function refreshAll() {
@@ -133,6 +228,10 @@ async function refreshAll() {
     await renderMonitoringView();
   } else if (currentTab === "releases") {
     await Promise.all([renderReleasesList(), renderCommandHistory()]);
+  } else if (currentTab === "evidence") {
+    await renderEvidenceView();
+  } else if (currentTab === "comparison") {
+    await renderComparisonView();
   } else if (currentTab === "faults") {
     await renderFaultTruth();
   } else if (currentTab === "evaluation") {
@@ -154,23 +253,57 @@ function updateControlBar(status) {
     freshnessEl.textContent = `Freshness: T=${status.data_freshness_tick ?? status.tick} (Live)`;
   }
 
-  // Update Advisories
+  // Update State Machine Pill & Calibration Badge
+  const monStateEl = document.getElementById("monitoring-state-pill");
+  if (monStateEl) {
+    const state = status.monitoring_state || (status.ssm_connected ? "MONITORING" : "CONNECTION_ERROR");
+    monStateEl.textContent = state;
+    if (state === "WAITING_FOR_DATA") {
+      monStateEl.className = "advisory-pill pill-neutral";
+    } else if (state === "MONITORING") {
+      monStateEl.className = "advisory-pill pill-normal";
+    } else if (state === "UNCALIBRATED_POLICY" || state === "INSUFFICIENT_DATA") {
+      monStateEl.className = "advisory-pill pill-warning";
+    } else {
+      monStateEl.className = "advisory-pill pill-danger";
+    }
+  }
+
+  const calBadge = document.getElementById("policy-calibration-badge");
+  if (calBadge) {
+    if (status.is_calibrated) {
+      calBadge.textContent = "Calibrated Policy (FAR=0.05, N=2000)";
+      calBadge.className = "badge badge-canary";
+    } else {
+      calBadge.textContent = "Uncalibrated Exploratory";
+      calBadge.className = "badge badge-warning";
+    }
+  }
+
+  // Update Advisories (never show green NORMAL before data arrives!)
   const infraEl = document.getElementById("advisory-infra");
   const releaseEl = document.getElementById("advisory-release");
 
   if (infraEl) {
     infraEl.textContent = status.infrastructure_advisory;
-    infraEl.className = "advisory-pill " +
-      (status.infrastructure_advisory === "NORMAL" ? "pill-normal" : "pill-danger");
+    let cls = "pill-normal";
+    if (status.infrastructure_advisory === "WAITING FOR DATA") cls = "pill-neutral";
+    else if (status.infrastructure_advisory !== "NORMAL") cls = "pill-danger";
+    infraEl.className = `advisory-pill ${cls}`;
   }
 
   if (releaseEl) {
     releaseEl.textContent = status.canary_release_advisory;
     let cls = "pill-normal";
-    if (status.canary_release_advisory === "DETECTOR NOT CONNECTED") cls = "pill-neutral";
-    else if (status.canary_release_advisory === "PAUSE RECOMMENDED") cls = "pill-danger";
-    else if (status.canary_release_advisory === "ROLLED BACK") cls = "pill-neutral";
-    else if (status.canary_release_advisory.includes("INSUFFICIENT")) cls = "pill-warning";
+    if (status.canary_release_advisory === "WAITING FOR DATA" || status.canary_release_advisory === "DETECTOR NOT CONNECTED") {
+      cls = "pill-neutral";
+    } else if (status.canary_release_advisory === "PAUSE RECOMMENDED") {
+      cls = "pill-danger";
+    } else if (status.canary_release_advisory === "ROLLED BACK") {
+      cls = "pill-neutral";
+    } else if (status.canary_release_advisory.includes("INSUFFICIENT")) {
+      cls = "pill-warning";
+    }
     releaseEl.className = `advisory-pill ${cls}`;
   }
 
@@ -1468,4 +1601,166 @@ function downloadFile(content, filename, type) {
   a.click();
   document.body.removeChild(a);
   URL.revokeObjectURL(url);
+}
+
+// ---------------------------------------------------------------------
+// Page: SSM Evidence View
+// ---------------------------------------------------------------------
+async function renderEvidenceView() {
+  const evidence = await apiGet("/api/detector/evidence");
+  const tableBody = document.getElementById("evidence-table-body");
+  const classContainer = document.getElementById("class-effects-container");
+  if (!evidence || !tableBody) return;
+
+  const servers = evidence.servers || {};
+  const canaryHosts = Object.values(servers).filter(s => s.role === "CANARY");
+
+  if (canaryHosts.length === 0) {
+    tableBody.innerHTML = `<tr><td colspan="11" style="text-align: center; color: var(--text-muted);">No active canary hosts deployed or waiting for simulation observations.</td></tr>`;
+  } else {
+    tableBody.innerHTML = "";
+    canaryHosts.forEach(s => {
+      const row = document.createElement("tr");
+      const latEff = s.latency_effect !== null ? s.latency_effect.toFixed(4) : "0.0000";
+      const latPct = s.latency_effect_pct !== null && s.latency_effect_pct !== undefined ? `${s.latency_effect_pct >= 0 ? '+' : ''}${s.latency_effect_pct.toFixed(2)}%` : `${((s.latency_effect || 0) * 100).toFixed(2)}%`;
+      const ciStr = (s.latency_ci_lower !== null && s.latency_ci_upper !== null)
+        ? `[${s.latency_ci_lower.toFixed(4)}, ${s.latency_ci_upper.toFixed(4)}]`
+        : "Pending";
+      const riskVal = s.host_risk !== null ? `${(s.host_risk * 100).toFixed(1)}%` : "N/A";
+      const logScoreVal = s.log_posterior_risk !== null && s.log_posterior_risk !== undefined ? s.log_posterior_risk.toFixed(3) : "N/A";
+      const memRate = s.memory_drift_mb_per_min !== null ? `${s.memory_drift_mb_per_min.toFixed(2)} MB/m` : "N/A";
+      const headroomStr = s.headroom_mb !== null ? `${s.headroom_mb.toFixed(0)} MB` : "N/A";
+      const tteStr = s.tte_min !== null ? `${s.tte_min.toFixed(1)}m` : "Inf";
+      const guardClass = s.guardrail_status === "NORMAL" ? "badge-version" : "badge-warning";
+
+      row.innerHTML = `
+        <td><strong>${s.server_id}</strong></td>
+        <td>Class ${s.class_id}</td>
+        <td>Rack ${s.rack_id}</td>
+        <td><code>${latEff}</code></td>
+        <td><small>${ciStr}</small></td>
+        <td><strong style="color: ${(s.latency_effect_pct || 0) > 2 ? 'var(--accent-red)' : 'var(--text-primary)'}">${latPct}</strong></td>
+        <td><b style="color: ${(s.host_risk || 0) > 0.5 ? 'var(--accent-red)' : 'var(--text-primary)'}">${riskVal}</b></td>
+        <td><code>${logScoreVal}</code></td>
+        <td>${memRate}</td>
+        <td>${headroomStr} / ${tteStr}</td>
+        <td><span class="badge ${guardClass}">${s.guardrail_status}</span></td>
+      `;
+      tableBody.appendChild(row);
+    });
+  }
+
+  if (classContainer) {
+    classContainer.innerHTML = "";
+    const classes = evidence.class_effects || [];
+    if (classes.length === 0) {
+      classContainer.innerHTML = `<div style="color: var(--text-muted); font-size: 0.85rem; padding: 0.5rem;">Class effects accumulating with baseline observations.</div>`;
+    } else {
+      classes.forEach(c => {
+        const card = document.createElement("div");
+        card.className = "card";
+        card.style.background = "var(--bg-primary)";
+        const meanPct = (c.mean_effect * 100).toFixed(2);
+        card.innerHTML = `
+          <div style="font-weight: 700; color: var(--accent-purple); margin-bottom: 0.5rem;">
+            Hardware Class ${c.class_id} Prior / Effect
+          </div>
+          <div class="grid-2" style="font-size: 0.82rem; gap: 0.4rem;">
+            <div>Class Mean Shift (c_k): <strong>${meanPct}%</strong></div>
+            <div>Standard Error (SE): <strong>${c.se ? c.se.toFixed(4) : 'N/A'}</strong></div>
+            <div>Variance (sigma^2): <strong>${c.variance ? c.variance.toExponential(3) : 'N/A'}</strong></div>
+            <div>Shrinkage Factor: <strong>Helmert Contrast Basis</strong></div>
+          </div>
+        `;
+        classContainer.appendChild(card);
+      });
+    }
+  }
+}
+
+// ---------------------------------------------------------------------
+// Page: Method Comparison View
+// ---------------------------------------------------------------------
+async function renderComparisonView() {
+  const comp = await apiGet("/api/detector/compare-methods");
+  if (!comp || !comp.methods) return;
+
+  const hier = comp.methods.hier || {};
+  const indep = comp.methods.indep || {};
+  const pooled = comp.methods.pooled || {};
+
+  // Hierarchical Card
+  const hierEffEl = document.getElementById("comp-hier-effect");
+  const hierScoreEl = document.getElementById("comp-hier-score");
+  const hierRiskEl = document.getElementById("comp-hier-risk");
+  const hierAdvEl = document.getElementById("comp-hier-advisory");
+
+  if (hierEffEl) hierEffEl.textContent = `${(hier.mean_effect_pct || 0).toFixed(2)}% (SE: ${(hier.se || 0).toFixed(4)})`;
+  if (hierScoreEl) hierScoreEl.textContent = hier.release_score !== null ? hier.release_score.toFixed(3) : "Pending";
+  if (hierRiskEl) hierRiskEl.textContent = hier.max_risk !== null ? `${(hier.max_risk * 100).toFixed(1)}%` : "N/A";
+  if (hierAdvEl) {
+    hierAdvEl.textContent = hier.advisory || "WAITING";
+    hierAdvEl.className = "advisory-pill " + (hier.advisory === "PAUSE RECOMMENDED" ? "pill-danger" : hier.advisory === "NORMAL" ? "pill-normal" : "pill-neutral");
+  }
+
+  // Independent Card
+  const indepEffEl = document.getElementById("comp-indep-effect");
+  const indepScoreEl = document.getElementById("comp-indep-score");
+  const indepRiskEl = document.getElementById("comp-indep-risk");
+  const indepAdvEl = document.getElementById("comp-indep-advisory");
+
+  if (indepEffEl) indepEffEl.textContent = `${(indep.mean_effect_pct || 0).toFixed(2)}% (SE: ${(indep.se || 0).toFixed(4)})`;
+  if (indepScoreEl) indepScoreEl.textContent = indep.release_score !== null ? indep.release_score.toFixed(3) : "Pending";
+  if (indepRiskEl) indepRiskEl.textContent = indep.max_risk !== null ? `${(indep.max_risk * 100).toFixed(1)}%` : "N/A";
+  if (indepAdvEl) {
+    indepAdvEl.textContent = indep.advisory || "WAITING";
+    indepAdvEl.className = "advisory-pill " + (indep.advisory === "PAUSE RECOMMENDED" ? "pill-danger" : indep.advisory === "NORMAL" ? "pill-normal" : "pill-neutral");
+  }
+
+  // Pooled Card
+  const pooledEffEl = document.getElementById("comp-pooled-effect");
+  const pooledScoreEl = document.getElementById("comp-pooled-score");
+  const pooledRiskEl = document.getElementById("comp-pooled-risk");
+  const pooledAdvEl = document.getElementById("comp-pooled-advisory");
+
+  if (pooledEffEl) pooledEffEl.textContent = `${(pooled.mean_effect_pct || 0).toFixed(2)}% (SE: ${(pooled.se || 0).toFixed(4)})`;
+  if (pooledScoreEl) pooledScoreEl.textContent = pooled.release_score !== null ? pooled.release_score.toFixed(3) : "Pending";
+  if (pooledRiskEl) pooledRiskEl.textContent = pooled.max_risk !== null ? `${(pooled.max_risk * 100).toFixed(1)}%` : "N/A";
+  if (pooledAdvEl) {
+    pooledAdvEl.textContent = pooled.advisory || "WAITING";
+    pooledAdvEl.className = "advisory-pill " + (pooled.advisory === "PAUSE RECOMMENDED" ? "pill-danger" : pooled.advisory === "NORMAL" ? "pill-normal" : "pill-neutral");
+  }
+
+  // Table breakdown
+  const compTableBody = document.getElementById("comparison-table-body");
+  if (!compTableBody) return;
+
+  const hierHosts = hier.hosts || {};
+  const indepHosts = indep.hosts || {};
+  const pooledHosts = pooled.hosts || {};
+  const serverIds = Object.keys(hierHosts);
+
+  if (serverIds.length === 0) {
+    compTableBody.innerHTML = `<tr><td colspan="7" style="text-align: center; color: var(--text-muted);">Awaiting active comparison telemetry.</td></tr>`;
+    return;
+  }
+
+  compTableBody.innerHTML = "";
+  serverIds.forEach(sid => {
+    const hH = hierHosts[sid] || {};
+    const iH = indepHosts[sid] || {};
+    const pH = pooledHosts[sid] || {};
+
+    const row = document.createElement("tr");
+    row.innerHTML = `
+      <td><strong>${sid}</strong></td>
+      <td style="color: var(--accent-purple);"><strong>${((hH.effect || 0) * 100).toFixed(2)}%</strong> (±${((hH.se || 0) * 100).toFixed(2)}%)</td>
+      <td>${hH.risk !== undefined ? (hH.risk * 100).toFixed(1) + '%' : 'N/A'}</td>
+      <td style="color: var(--accent-blue);">${((iH.effect || 0) * 100).toFixed(2)}% (±${((iH.se || 0) * 100).toFixed(2)}%)</td>
+      <td>${iH.risk !== undefined ? (iH.risk * 100).toFixed(1) + '%' : 'N/A'}</td>
+      <td style="color: var(--accent-orange);">${((pH.effect || 0) * 100).toFixed(2)}% (±${((pH.se || 0) * 100).toFixed(2)}%)</td>
+      <td>${pH.risk !== undefined ? (pH.risk * 100).toFixed(1) + '%' : 'N/A'}</td>
+    `;
+    compTableBody.appendChild(row);
+  });
 }

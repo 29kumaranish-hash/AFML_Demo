@@ -89,6 +89,10 @@ class ImportRunRequest(BaseModel):
     bundle: dict[str, Any]
 
 
+class LoadScenarioRequest(BaseModel):
+    name: str = Field(..., description="Canonical scenario name from catalog")
+
+
 # ---------------------------------------------------------------------
 # World & Clock Routes
 # ---------------------------------------------------------------------
@@ -250,9 +254,31 @@ def get_detector_evidence() -> dict[str, Any]:
     return get_service().get_detector_evidence()
 
 
+@router.get("/detector/compare-methods")
+def get_comparison_evidence() -> dict[str, Any]:
+    """Side-by-side comparison of Hierarchical, Independent, and Pooled SSM."""
+    return get_service().get_comparison_evidence()
+
+
 @router.get("/detector/timeline")
 def get_detector_timeline(limit: int = Query(120, ge=1, le=1000)) -> list[dict[str, Any]]:
     return get_service().get_detector_timeline(limit=limit)
+
+
+# ---------------------------------------------------------------------
+# Scenario Catalog & Guided Presets
+# ---------------------------------------------------------------------
+@router.get("/scenarios")
+def list_scenarios() -> list[dict[str, Any]]:
+    return get_service().list_scenarios()
+
+
+@router.post("/scenarios/load")
+def load_scenario(req: LoadScenarioRequest) -> dict[str, Any]:
+    try:
+        return get_service().load_scenario(req.name)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
 
 
 # ---------------------------------------------------------------------

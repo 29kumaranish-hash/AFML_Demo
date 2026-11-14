@@ -1,8 +1,15 @@
 # Virtual Data Center & Canary Detection: Implementation Status & Audit
 
-**Document Version:** 2.1.0 (Versioned Scenarios, One-Command Demo, Scaling Benchmarks, Publication Plots & Technical Limitations Complete)  
+**Document Version:** 2.2.0 (Correctness Audit, Inference Parity, Policy Validation, 7-Step Dashboard & Method Comparison Complete)  
 **Date:** 2026-11-14  
-**Status:** COMPLETE — Versioned scenario suite (`canary_ssm/scenarios/`, 8 canonical scenarios), one-command local demo startup (`scripts/demo.py`, `canary-ssm demo`), separate persistence of 5 distinct artifacts (`manifest.json`, `telemetry.csv`, `model_policy.json`, `recommendations.csv`, `evaluator_results.json`), fleet scaling benchmark across 12 to 384 servers with hardware profiling (`results/runtime_scaling.csv`), publication figures generated strictly from CSV tables (`results/plots/`), comprehensive technical limitations document (`docs/LIMITATIONS.md`), and preserved original benchmark configs verified. Exit gate passed: fresh local runs reproduce telemetry and detector outputs with exact parity. Full fast test suite: 229 passed, 1 skipped, 1 deselected in 104.39s with zero regressions.  
+**Status:** COMPLETE — Full investigation and resolution of 7 audit findings.
+1. **Calibrated vs Exploratory Policies:** Explicit `FrozenPolicy` metadata (`is_calibrated: bool`, `calibration_status`, `threshold_scale`), factory `create_calibrated_hier_policy(threshold_lat=-1.14122, threshold_mem=-0.67302, ...)` matching `table_null_validation.csv`, and strict policy compatibility validation (`validate_policy_compatibility`).
+2. **Inference Parity:** Bit-for-bit numerical parity ($< 10^{-12}$) between batch `EffectDetector.run` and streaming `OnlineHierarchicalLatencyFilter.step` via pre-period noise conditioning and Joseph-form Kalman updates across `hier`, `indep`, and `pooled` models (`tests/test_inference_parity.py`).
+3. **Posterior Risk Presentation:** Clear labeling as **"Release score: maximum host risk"** ($\max_i \log P(a_i > \log(1.02))$), log-scale boundary $\kappa_{\text{lat}} = \log(1.02) \approx +2.0\%$ shift, percentage credible intervals, and initial null score handling (set to `None`, avoiding misleading `0.0`).
+4. **State Machine Integrity:** 8-state `SystemMonitoringState` machine (`WAITING_FOR_DATA`, `INSUFFICIENT_DATA`, `MONITORING`, `STALE_DATA`, `CONNECTION_ERROR`, `COMPLETED_REPLAY`, `PAUSED_MONITORING`, `UNCALIBRATED_POLICY`). Initial/stale/disconnected states display neutral or warning pills and never false green `NORMAL`.
+5. **Gate G2 Transparency:** Complete evaluation audit matrix with Gate G2 Beta-Binomial validity banners, prominently highlighting the known failure of `hier_rank0` on `S5_label_errors` ($p = 1.218 \times 10^{-8}$) due to omitted factor subtraction.
+6. **Documentation & Scope Reconciliation:** Reconciled test counts across all documentation (**248+ tests passing**). Explicitly noted that Borg cluster traces and neural/Mamba/LSTM baselines were designated as deferred research scope in `docs/DESIGN_DECISIONS.md`.
+7. **Redesigned Dashboard UX:** 8-tab SPA with 1-click Quick-Start demo presets, guided 7-step workflow, dedicated Method Comparison tab (Hierarchical SSM vs Independent SSM vs Complete Pooling), dedicated SSM Evidence tab (host effects, within-class shrinkage, memory drift), and strict Evaluator Truth firewall.
 
 ---
 
@@ -10,6 +17,7 @@
 
 This document tracks the incremental implementation of the Virtual Data Center in `canary_ssm`.
 
+- **Audit & Correctness Verification (Finding 1–7):** Completed. Investigated and fixed all 7 audit findings. Added `tests/test_inference_parity.py`, `tests/test_policy_validation.py`, `tests/test_api_scenarios.py`, and redesigned dashboard with 1-click presets and real-time pooling method comparison. Verified with 248+ passing tests.
 - **Prompt 0 (Audit & Architecture Freeze):** Completed. Architecture frozen in `docs/virtual_world_architecture.md`.
 - **Prompt 1 (Virtual Fleet & Clock):** Completed. Configurable `Fleet`, `Rack`, `Server` records, default 4-rack 24-server topology, deterministic discrete `SimulatedClock`, priority `EventQueue`, and `VirtualWorld` engine implemented. Verified by 13 unit tests (`tests/test_world.py`, all passing in 0.71s).
 - **Prompt 2 (Realistic Multi-Metric Telemetry):** Completed. `TelemetryRecord` contract, dynamic server numerical states (`ServerResourceState`), and `HealthyTelemetryEngine` implemented. Emits request counts, CPU utilization, process memory, log latency, and error counts under fleet-wide demand, diurnal cycles, rack-shared nuisance variations, and hardware class offsets. Enforces strict bounds and anti-leakage firewall. Verified by 8 unit tests (`tests/test_telemetry.py`, all passing in 0.34s).

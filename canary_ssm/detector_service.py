@@ -32,8 +32,8 @@ from scipy.linalg import block_diag, cho_factor, cho_solve
 from scipy.stats import norm
 
 from canary_ssm.decision import MultiChannelAlertPolicy
-from canary_ssm.hierarchy import EffectParams, class_structure
-from canary_ssm.kalman import symmetrize
+from canary_ssm.hierarchy import EffectParams, class_structure, build_model
+from canary_ssm.kalman import KalmanFilter, symmetrize
 from canary_ssm.memory import (
     MemoryStepResult,
     MemoryTargetDefinition,
@@ -52,22 +52,151 @@ from canary_ssm.telemetry.slicing import (
 )
 
 
+class SystemMonitoringState:
+    """Standardized 8-state machine for operational monitoring and dashboard display."""
+    WAITING_FOR_DATA = "WAITING_FOR_DATA"
+    INSUFFICIENT_DATA = "INSUFFICIENT_DATA"
+    MONITORING = "MONITORING"
+    STALE_DATA = "STALE_DATA"
+    CONNECTION_ERROR = "CONNECTION_ERROR"
+    COMPLETED_REPLAY = "COMPLETED_REPLAY"
+    PAUSED_MONITORING = "PAUSED_MONITORING"
+    UNCALIBRATED_POLICY = "UNCALIBRATED_POLICY"
+
+
 @dataclass(frozen=True)
 class FrozenPolicy:
-    """Frozen decision policy calibrated on healthy null data (FWER <= 0.05)."""
+    """Frozen decision policy.
+
+    Distinguishes calibrated policies (which control fleet-wide false alert rate under a declared horizon)
+    from exploratory configurations using uncalibrated default cutoffs.
+    """
     policy_id: str = "POLICY-SIDAK-0.05"
     model_id: str = "MODEL-HSSM-V1"
     alpha: float = 0.05
-    threshold_lat: float = -0.693147        # log(0.50): max-host risk > 50%
+    threshold_lat: float = -0.693147        # log(0.50): max-host risk > 50% (exploratory default)
     threshold_mem: float = -0.693147        # log(0.50): max-host drift exceedance > 50%
+    threshold_scale: str = "LOG_POSTERIOR_RISK"  # Scale: log-probability in (-inf, 0.0]
     require_persistence: bool = True
     persistence_window: int = 10            # Consecutive ticks above kappa_M
-    kappa_lat: float = float(KAPPA)         # log(1.02) ~ 0.0198026
+    persistence_k: int = 1                  # Consecutive crossings rule
+    kappa_lat: float = float(KAPPA)         # log(1.02) ~ 0.0198026 (+2% latency shift)
     kappa_mem: float = 0.50                 # 0.50 MB/min
+    is_calibrated: bool = False
+    calibration_status: str = "UNVALIDATED_EXPLORATORY"  # "CALIBRATED" | "UNVALIDATED_EXPLORATORY" | "FAILED_CALIBRATION"
+    achieved_far: float | None = None
+    evaluation_horizon: int = 75
+    topology_signature: str | None = None
+    description: str = (
+        "Exploratory policy using default log-score thresholds (not calibrated for fleet-wide false-alert control)."
+    )
     epistemic_disclaimer: str = (
         "Statistical evidence of abnormal metric shift relative to matched baseline controls. "
         "Observational evidence is consistent with a release regression, not proof of a code bug."
     )
+
+
+def create_uncalibrated_exploratory_policy(
+    policy_id: str = "POLICY-UNVALIDATED-DEFAULT",
+    threshold_lat: float = -0.693147,
+    threshold_mem: float = -0.693147,
+) -> FrozenPolicy:
+    """Factory for exploratory policy with explicit uncalibrated status."""
+    return FrozenPolicy(
+        policy_id=policy_id,
+        model_id="MODEL-HSSM-V1",
+        alpha=0.05,
+        threshold_lat=threshold_lat,
+        threshold_mem=threshold_mem,
+        threshold_scale="LOG_POSTERIOR_RISK",
+        require_persistence=True,
+        persistence_window=10,
+        is_calibrated=False,
+        calibration_status="UNVALIDATED_EXPLORATORY",
+        achieved_far=None,
+        description="Uncalibrated exploratory policy. Scores are diagnostic only; not calibrated for fleet-wide false alerts.",
+    )
+
+
+def create_calibrated_hier_policy(
+    policy_id: str = "POLICY-CALIBRATED-HSSM-0.05",
+    threshold_lat: float = -1.14122,       # From results/table_null_validation.csv
+    threshold_mem: float = -0.67302,       # Multi-channel null validation threshold
+    evaluation_horizon: int = 75,
+) -> FrozenPolicy:
+    """Factory for validated policy with empirical FWER <= 0.05 passing Gate G2."""
+    return FrozenPolicy(
+        policy_id=policy_id,
+        model_id="MODEL-HSSM-V1",
+        alpha=0.05,
+        threshold_lat=threshold_lat,
+        threshold_mem=threshold_mem,
+        threshold_scale="LOG_POSTERIOR_RISK",
+        require_persistence=True,
+        persistence_window=10,
+        is_calibrated=True,
+        calibration_status="CALIBRATED",
+        achieved_far=0.01,
+        evaluation_horizon=evaluation_horizon,
+        description="Calibrated Hierarchical SSM policy from results/table_null_validation.csv (Gate G2 PASS, achieved FAR=1.0%).",
+    )
+
+
+def validate_policy_compatibility(
+    policy: FrozenPolicy,
+    expected_model_id: str = "MODEL-HSSM-V1",
+    n_canaries: int | None = None,
+    horizon: int | None = None,
+    require_calibrated: bool = False,
+) -> tuple[bool, list[str]]:
+    """Validate policy compatibility against model, topology, and scale constraints.
+
+    Rejects:
+    - Model ID mismatches.
+    - Positive threshold values on log-posterior scale (since log(p) <= 0).
+    - Uncalibrated policies when calibrated status is required.
+    - Horizon under-specification.
+    - Invalid alpha bounds.
+    """
+    reasons: list[str] = []
+
+    # Check model ID
+    if policy.model_id != expected_model_id:
+        reasons.append(
+            f"Policy model_id '{policy.model_id}' does not match active detector model '{expected_model_id}'."
+        )
+
+    # Check scale constraints: log-probability scale MUST be <= 0.0
+    if policy.threshold_scale == "LOG_POSTERIOR_RISK":
+        if policy.threshold_lat > 0.0:
+            reasons.append(
+                f"threshold_lat={policy.threshold_lat:.4f} is invalid for LOG_POSTERIOR_RISK scale (must be <= 0.0)."
+            )
+        if policy.threshold_mem > 0.0:
+            reasons.append(
+                f"threshold_mem={policy.threshold_mem:.4f} is invalid for LOG_POSTERIOR_RISK scale (must be <= 0.0)."
+            )
+
+    # Check alpha bounds
+    if not (0.0 < policy.alpha <= 1.0):
+        reasons.append(f"Declared false alert budget alpha={policy.alpha} must be in (0, 1].")
+
+    # Check calibration requirement
+    if require_calibrated:
+        if not policy.is_calibrated or policy.calibration_status != "CALIBRATED":
+            reasons.append(
+                f"Policy '{policy.policy_id}' has calibration_status='{policy.calibration_status}'. "
+                "A calibrated policy artifact passing Gate G2 validation is required for deployment recommendations."
+            )
+
+    # Check horizon compatibility
+    if horizon is not None and policy.evaluation_horizon < horizon:
+        reasons.append(
+            f"Evaluation horizon {horizon} exceeds policy calibrated horizon {policy.evaluation_horizon}."
+        )
+
+    is_valid = (len(reasons) == 0)
+    return is_valid, reasons
 
 
 @dataclass
@@ -82,6 +211,9 @@ class HostEvidence:
     latency_se: float | None = None
     latency_ci_lower: float | None = None
     latency_ci_upper: float | None = None
+    latency_effect_pct: float | None = None
+    latency_ci_lower_pct: float | None = None
+    latency_ci_upper_pct: float | None = None
     host_risk: float | None = None          # Pr(a_i > kappa_lat)
     host_log_score: float | None = None     # log Pr(a_i > kappa_lat)
     # Memory growth & capacity guardrail
@@ -109,6 +241,9 @@ class HostEvidence:
             "latency_se": round(self.latency_se, 5) if self.latency_se is not None else None,
             "latency_ci_lower": round(self.latency_ci_lower, 5) if self.latency_ci_lower is not None else None,
             "latency_ci_upper": round(self.latency_ci_upper, 5) if self.latency_ci_upper is not None else None,
+            "latency_effect_pct": round(self.latency_effect_pct, 2) if self.latency_effect_pct is not None else None,
+            "latency_ci_lower_pct": round(self.latency_ci_lower_pct, 2) if self.latency_ci_lower_pct is not None else None,
+            "latency_ci_upper_pct": round(self.latency_ci_upper_pct, 2) if self.latency_ci_upper_pct is not None else None,
             "host_risk": round(self.host_risk, 4) if self.host_risk is not None else None,
             "host_log_score": round(self.host_log_score, 4) if self.host_log_score is not None else None,
             "memory_drift_mb_per_min": round(self.memory_drift_mb_per_min, 3) if self.memory_drift_mb_per_min is not None else None,
@@ -154,9 +289,9 @@ class DetectorTickResult:
     is_unidentifiable: bool
     ineligible_reasons: list[str]
     attribution_blocked_reasons: list[str]
-    infrastructure_advisory: str            # NORMAL | RACK_DEGRADED: {racks} | FLEET_OUTAGE
-    canary_release_advisory: str            # RUNNING | PAUSE RECOMMENDED | CRITICAL_OOM_RISK | INSUFFICIENT DATA / CONFLICT | ROLLED BACK
-    attribution: str                        # NORMAL | LATENCY_REGRESSION | MEMORY_GROWTH_LEAK | COMPOUND_REGRESSION | CRITICAL_CAPACITY_LIMIT | INSUFFICIENT_DATA | ROLLED_BACK
+    infrastructure_advisory: str            # NORMAL | RACK_DEGRADED: {racks} | FLEET_OUTAGE | WAITING_FOR_DATA
+    canary_release_advisory: str            # RUNNING | PAUSE RECOMMENDED | CRITICAL_OOM_RISK | INSUFFICIENT DATA / CONFLICT | ROLLED BACK | WAITING_FOR_DATA
+    attribution: str                        # NORMAL | LATENCY_REGRESSION | MEMORY_GROWTH_LEAK | COMPOUND_REGRESSION | CRITICAL_CAPACITY_LIMIT | INSUFFICIENT_DATA | ROLLED_BACK | WAITING_FOR_DATA
     advisory_reason: str
     epistemic_disclaimer: str
     # Scores & Thresholds
@@ -166,21 +301,29 @@ class DetectorTickResult:
     threshold_lat: float
     threshold_mem: float
     first_alert_tick: int | None
+    # Probabilities and Scales
+    release_score_prob: float | None = None
+    threshold_lat_prob: float | None = None
+    threshold_mem_prob: float | None = None
+    threshold_scale: str = "LOG_POSTERIOR_RISK"
+    monitoring_state: str = "MONITORING"
+    calibration_status: str = "CALIBRATED"
+    is_calibrated: bool = False
     # Breakdowns
-    hosts: dict[str, HostEvidence]
-    class_effects: list[ClassEvidence]
+    hosts: dict[str, HostEvidence] = field(default_factory=dict)
+    class_effects: list[ClassEvidence] = field(default_factory=list)
     # Matched series averages for plotting
-    canary_latency_mean: float
-    control_latency_mean: float
-    canary_memory_mean: float
-    control_memory_mean: float
-    canary_cpu_mean: float
-    control_cpu_mean: float
-    canary_errors_sum: int
-    control_errors_sum: int
-    canary_effect_mean: float
-    canary_effect_ci_lower: float
-    canary_effect_ci_upper: float
+    canary_latency_mean: float = 0.0
+    control_latency_mean: float = 0.0
+    canary_memory_mean: float = 0.0
+    control_memory_mean: float = 0.0
+    canary_cpu_mean: float = 0.0
+    control_cpu_mean: float = 0.0
+    canary_errors_sum: int = 0
+    control_errors_sum: int = 0
+    canary_effect_mean: float = 0.0
+    canary_effect_ci_lower: float = 0.0
+    canary_effect_ci_upper: float = 0.0
     # Operational intervention metadata
     auto_rollback_triggered: bool = False
     intervention_tick: int | None = None
@@ -200,10 +343,17 @@ class DetectorTickResult:
             "advisory_reason": self.advisory_reason,
             "epistemic_disclaimer": self.epistemic_disclaimer,
             "release_score": round(self.release_score, 4) if self.release_score is not None else None,
+            "release_score_prob": round(self.release_score_prob, 4) if self.release_score_prob is not None else (round(float(math.exp(self.release_score)), 4) if self.release_score is not None else None),
             "score_lat": round(self.score_lat, 4) if self.score_lat is not None else None,
             "score_mem": round(self.score_mem, 4) if self.score_mem is not None else None,
             "threshold_lat": self.threshold_lat,
             "threshold_mem": self.threshold_mem,
+            "threshold_lat_prob": round(self.threshold_lat_prob, 4) if self.threshold_lat_prob is not None else round(float(math.exp(self.threshold_lat)), 4),
+            "threshold_mem_prob": round(self.threshold_mem_prob, 4) if self.threshold_mem_prob is not None else round(float(math.exp(self.threshold_mem)), 4),
+            "threshold_scale": self.threshold_scale,
+            "monitoring_state": self.monitoring_state,
+            "calibration_status": self.calibration_status,
+            "is_calibrated": self.is_calibrated,
             "first_alert_tick": self.first_alert_tick,
             "hosts": {k: v.to_dict() for k, v in self.hosts.items()},
             "class_effects": [c.to_dict() for c in self.class_effects],
@@ -225,69 +375,134 @@ class DetectorTickResult:
 
 
 class OnlineHierarchicalLatencyFilter:
-    """Streaming Hierarchical Latency Kalman Filter with Joseph updates and Helmert basis."""
+    """Streaming Latency Kalman Filter with Joseph updates, Helmert contrast basis, and pre-period noise conditioning.
+
+    Guarantees strict numerical parity with batch EffectDetector (hierarchy.py):
+    - Supports model kinds: 'hier', 'indep', 'pooled' via build_model
+    - Class-specific AR noise parameters (phi_e, q_e, v_meas)
+    - Pre-period noise Kalman filter carried forward into rollout prior at t0
+    - Exact Joseph covariance updates via shared KalmanFilter implementation
+    - Identical posterior effect extraction (L @ m), covariance, host risks, and release score
+    """
 
     def __init__(
         self,
-        canary_ids: list[str],
-        canary_classes: list[int],
+        canary_ids: list[str] | None = None,
+        canary_classes: list[int] | np.ndarray | None = None,
         params: EffectParams | None = None,
-        phi_e: float = 0.85,
-        q_e: float = 0.015,
-        v_meas: float = 0.005,
+        phi_e: float | list[float] | np.ndarray = 0.85,
+        q_e: float | list[float] | np.ndarray = 0.015,
+        v_meas: float | list[float] | np.ndarray = 0.005,
         kappa: float = float(KAPPA),
+        *,
+        classes: list[int] | np.ndarray | None = None,
     ) -> None:
-        self.canary_ids = list(canary_ids)
-        self.canary_classes = np.asarray(canary_classes, int)
-        self.nc = len(self.canary_ids)
+        # Handle parameter order variations:
+        if classes is not None:
+            raw_classes = classes
+            raw_ids = canary_ids
+        elif canary_classes is not None:
+            raw_classes = canary_classes
+            raw_ids = canary_ids
+        elif canary_ids is not None and len(canary_ids) > 0 and isinstance(canary_ids[0], (int, np.integer)):
+            raw_classes = canary_ids
+            raw_ids = None
+        else:
+            raw_classes = [0]
+            raw_ids = canary_ids
+
+        self.canary_classes = np.asarray(raw_classes, int)
+        self.nc = len(self.canary_classes)
+        self.canary_ids = list(raw_ids) if raw_ids is not None else [f"canary_{i}" for i in range(self.nc)]
         self.p = params or EffectParams(kind="hier", rho_g=0.95, rho_h=0.95, sd_g=0.005, sd_h_ratio=1.0, prior_sd=0.03)
-        self.phi_e = float(phi_e)
-        self.q_e = float(q_e)
-        self.v_meas = float(v_meas)
         self.kappa = float(kappa)
 
-        # Build class structure matrices C and Helmert basis B
-        self.C, self.B = class_structure(self.canary_classes)
-        self.G = self.C.shape[1]
-        self.d = self.C.shape[1] + self.B.shape[1]
-        self.L = np.hstack([self.C, self.B]) if self.B.shape[1] > 0 else self.C
+        # Parse per-host AR noise vectors
+        self.phi = self._parse_per_host_param(phi_e)
+        self.qe = self._parse_per_host_param(q_e)
+        self.vv = self._parse_per_host_param(v_meas)
 
-        # Dimension: effect states d + AR noise states nc
+        # Build model matrices L, rho, sd using shared hierarchy build_model
+        self.L, self.rho, self.sd = build_model(self.p, self.canary_classes)
+        self.d = self.L.shape[1]
         self.dim = self.d + self.nc
 
-        # Transition matrix F
-        rho_eff = np.r_[np.full(self.G, self.p.rho_g), np.full(self.B.shape[1], self.p.rho_h)]
-        self.F = block_diag(np.diag(rho_eff), np.diag(np.full(self.nc, self.phi_e)))
+        # Pre-period noise-only filter: kn
+        var_init = self.qe ** 2 / np.maximum(1e-6, 1.0 - self.phi ** 2)
+        self.kn = KalmanFilter(
+            F=np.diag(self.phi),
+            Q=np.diag(self.qe ** 2),
+            m0=np.zeros(self.nc),
+            P0=np.diag(var_init),
+        )
 
-        # Process noise Q
-        sd_eff = np.r_[np.full(self.G, self.p.sd_g), np.full(self.B.shape[1], self.p.sd_g * self.p.sd_h_ratio)]
-        self.Q = block_diag(np.diag(sd_eff ** 2), np.diag(np.full(self.nc, self.q_e ** 2)))
+        # Rollout filter: kf (initialized at t0 via initialize_rollout)
+        self.kf: KalmanFilter | None = None
+        self.is_rollout_initialized: bool = False
 
-        # Observation matrix H: y_adj = L * s_eff + e_t + nu_t
-        self.H = np.hstack([self.L, np.eye(self.nc)])
+    def _parse_per_host_param(self, val: float | list[float] | np.ndarray) -> np.ndarray:
+        if np.ndim(val) == 0:
+            return np.full(self.nc, float(val))
+        arr = np.asarray(val, float)
+        if len(arr) == self.nc:
+            return arr
+        max_class = int(np.max(self.canary_classes)) if len(self.canary_classes) else 0
+        if len(arr) > max_class:
+            return np.array([arr[g] for g in self.canary_classes], float)
+        return np.full(self.nc, float(arr[0]))
 
-        # Effect extraction matrix: a_hat = L * s_eff
-        self.L_full = np.hstack([self.L, np.zeros((self.nc, self.nc))])
+    def step_preperiod(
+        self,
+        r_latency: np.ndarray | None = None,
+        obs_mask: np.ndarray | None = None,
+        cov_U: np.ndarray | None = None,
+    ) -> None:
+        """Step pre-period noise-only filter to causally condition AR state before t0."""
+        I = np.eye(self.nc)
+        use = (r_latency is not None and obs_mask is not None and np.any(obs_mask))
+        if use:
+            idx = np.flatnonzero(obs_mask)
+            V = np.diag(self.vv ** 2)
+            if cov_U is not None and np.all(np.isfinite(cov_U)) and cov_U.shape == (self.nc, self.nc):
+                V = V + cov_U
+            self.kn.step(r_latency[idx], I[idx], V[np.ix_(idx, idx)])
+        else:
+            self.kn.step()
 
-        # State vector and covariance
-        self.m = np.zeros(self.dim, dtype=float)
-        # Proper prior: zero mean, prior_sd^2 on effects, stationary variance on AR noise
-        var_ar = self.q_e ** 2 / max(1e-6, 1.0 - self.phi_e ** 2)
-        P_eff = np.eye(self.d) * (self.p.prior_sd ** 2)
-        P_ar = np.eye(self.nc) * var_ar
-        self.P = symmetrize(block_diag(P_eff, P_ar))
+    def initialize_rollout(self) -> None:
+        """Initialize rollout filter at t0, transferring conditioned AR state and covariance."""
+        F = block_diag(np.diag(self.rho), np.diag(self.phi))
+        Q = block_diag(np.diag(self.sd ** 2), np.diag(self.qe ** 2))
+        m0 = np.r_[np.zeros(self.d), self.kn.m]
+        P0 = block_diag(np.eye(self.d) * (self.p.prior_sd ** 2), self.kn.P)
+        self.kf = KalmanFilter(F, Q, m0, P0)
+        self.is_rollout_initialized = True
 
     def reset_prior(self, pre_ar_state: np.ndarray | None = None, pre_ar_cov: np.ndarray | None = None) -> None:
-        """Reset effect prior to zero with proper variance while carrying AR noise state forward."""
-        self.m[:self.d] = 0.0
+        """Reset effect prior while setting or preserving pre-period AR noise state."""
         if pre_ar_state is not None:
-            self.m[self.d:] = pre_ar_state
-        self.P[:self.d, :self.d] = np.eye(self.d) * (self.p.prior_sd ** 2)
-        self.P[:self.d, self.d:] = 0.0
-        self.P[self.d:, :self.d] = 0.0
+            self.kn.m = np.asarray(pre_ar_state, float).copy()
         if pre_ar_cov is not None:
-            self.P[self.d:, self.d:] = pre_ar_cov
-        self.P = symmetrize(self.P)
+            self.kn.P = symmetrize(np.asarray(pre_ar_cov, float).copy())
+        self.initialize_rollout()
+
+    @property
+    def m(self) -> np.ndarray:
+        return self.kf.m if self.kf is not None else np.zeros(self.dim)
+
+    @m.setter
+    def m(self, val: np.ndarray) -> None:
+        if self.kf is not None:
+            self.kf.m = np.asarray(val, float).copy()
+
+    @property
+    def P(self) -> np.ndarray:
+        return self.kf.P if self.kf is not None else np.eye(self.dim)
+
+    @P.setter
+    def P(self, val: np.ndarray) -> None:
+        if self.kf is not None:
+            self.kf.P = symmetrize(np.asarray(val, float).copy())
 
     def step(
         self,
@@ -295,65 +510,53 @@ class OnlineHierarchicalLatencyFilter:
         obs_mask: np.ndarray | None = None,
         cov_U: np.ndarray | None = None,
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, float]:
-        """Causal step update.
+        """Causal rollout step update.
 
         Returns:
             (a_hat, a_se, class_thetas, class_thetas_se, log_release_score)
         """
-        # Step 1: Prediction
-        self.m = self.F @ self.m
-        self.P = symmetrize(self.F @ self.P @ self.F.T + self.Q)
+        if not self.is_rollout_initialized:
+            self.initialize_rollout()
 
-        # Step 2: Measurement update if observations are available
+        H = np.hstack([self.L, np.eye(self.nc)])
+        Lfull = np.hstack([self.L, np.zeros((self.nc, self.nc))])
+
         has_obs = (r_latency is not None and obs_mask is not None and np.any(obs_mask))
         if has_obs:
             idx = np.flatnonzero(obs_mask)
-            y_obs = r_latency[idx]
-            H_obs = self.H[idx, :]
-
-            # Measurement covariance V_obs
-            V_base = np.eye(self.nc) * (self.v_meas ** 2)
+            V = np.diag(self.vv ** 2)
             if cov_U is not None and np.all(np.isfinite(cov_U)) and cov_U.shape == (self.nc, self.nc):
-                V_total = V_base + cov_U
-            else:
-                V_total = V_base
-            V_obs = V_total[np.ix_(idx, idx)]
-
-            # Innovation & Joseph update
-            v = y_obs - H_obs @ self.m
-            PHt = self.P @ H_obs.T
-            S = symmetrize(H_obs @ PHt + V_obs)
-
-            try:
-                cf = cho_factor(S, lower=True, check_finite=False)
-                K = cho_solve(cf, PHt.T, check_finite=False).T
-                self.m = self.m + K @ v
-                IKH = np.eye(self.dim) - K @ H_obs
-                self.P = symmetrize(IKH @ self.P @ IKH.T + K @ V_obs @ K.T)
-            except Exception:
-                # Numerical safeguard: fallback to pseudo-inverse if Cholesky fails
-                K = PHt @ np.linalg.pinv(S)
-                self.m = self.m + K @ v
-                IKH = np.eye(self.dim) - K @ H_obs
-                self.P = symmetrize(IKH @ self.P @ IKH.T + K @ V_obs @ K.T)
+                V = V + cov_U
+            self.kf.step(r_latency[idx], H[idx], V[np.ix_(idx, idx)])
+        else:
+            self.kf.step()
 
         # Extract posterior host effect estimates
-        a_hat = self.L_full @ self.m
-        cov_a = self.L @ self.P[:self.d, :self.d] @ self.L.T
-        var_a = np.maximum(np.diag(cov_a), 1e-12)
+        am = Lfull @ self.kf.m
+        cov_mat = self.L @ self.kf.P[:self.d, :self.d] @ self.L.T
+        var_a = np.maximum(np.diag(cov_mat), 1e-18)
         a_se = np.sqrt(var_a)
 
         # Extract class effect estimates
-        class_thetas = self.m[:self.G].copy()
-        class_thetas_se = np.sqrt(np.maximum(np.diag(self.P[:self.G, :self.G]), 1e-12))
+        if self.p.kind == "hier":
+            C_mat, _ = class_structure(self.canary_classes)
+            G = C_mat.shape[1]
+            class_thetas = self.kf.m[:G].copy()
+            class_thetas_se = np.sqrt(np.maximum(np.diag(self.kf.P[:G, :G]), 1e-18))
+        elif self.p.kind == "pooled":
+            class_thetas = self.kf.m[0:1].copy()
+            class_thetas_se = np.sqrt(np.maximum(np.diag(self.kf.P[:1, :1]), 1e-18))
+        else:  # indep
+            class_thetas = self.kf.m[:self.nc].copy()
+            class_thetas_se = np.sqrt(np.maximum(np.diag(self.kf.P[:self.nc, :self.nc]), 1e-18))
 
         # Compute host harm risks Pr(a_i > kappa_lat) and log max-host release score
-        z = (a_hat - self.kappa) / a_se
-        probs = norm.sf(-z)  # sf(-z) = Phi(z)
-        log_probs = norm.logsf(-z)
-        log_release_score = float(np.max(log_probs)) if len(log_probs) else float("-inf")
+        # Using exact formula zz = (kappa - a_hat) / a_se; prob = norm.sf(zz); score = norm.logsf(zz)
+        zz = (self.kappa - am) / a_se
+        log_probs = norm.logsf(zz)
+        log_release_score = float(np.nanmax(log_probs)) if len(log_probs) else float("-inf")
 
-        return a_hat, a_se, class_thetas, class_thetas_se, log_release_score
+        return am, a_se, class_thetas, class_thetas_se, log_release_score
 
 
 class DetectorService:
@@ -484,6 +687,18 @@ class DetectorService:
             params=self.effect_params,
             kappa=self.frozen_policy.kappa_lat,
         )
+        self.lat_filter_indep = OnlineHierarchicalLatencyFilter(
+            canary_ids=self.active_canary_ids,
+            canary_classes=canary_classes,
+            params=EffectParams(kind="indep", rho_g=self.effect_params.rho_g, sd_g=self.effect_params.sd_g, prior_sd=self.effect_params.prior_sd),
+            kappa=self.frozen_policy.kappa_lat,
+        )
+        self.lat_filter_pooled = OnlineHierarchicalLatencyFilter(
+            canary_ids=self.active_canary_ids,
+            canary_classes=canary_classes,
+            params=EffectParams(kind="pooled", rho_g=self.effect_params.rho_g, sd_g=self.effect_params.sd_g, prior_sd=self.effect_params.prior_sd),
+            kappa=self.frozen_policy.kappa_lat,
+        )
         self.mem_detector = OnlineMemoryGrowthDetector(
             t0=self.t0,
             canary_ids=self.active_canary_ids,
@@ -491,6 +706,35 @@ class DetectorService:
             canary_capacities_mb=canary_caps,
             target_definition=self.memory_target,
         )
+
+        # Pre-period noise conditioning: step through pre-period residuals to align prior at t0
+        if self.slice_builder.baseline is not None and self.t0 is not None and self.t0 > 0:
+            for t_pre in range(self.t0):
+                slice_pre = self.slice_builder.build_slice(t_pre)
+                nc = len(self.active_canary_ids)
+                r_pre = np.zeros(nc, dtype=float)
+                m_pre = np.zeros(nc, dtype=bool)
+                cov_pre = np.zeros((nc, nc), dtype=float)
+                for i, cid in enumerate(self.active_canary_ids):
+                    if cid in slice_pre.canary_ids:
+                        s_idx = slice_pre.canary_ids.index(cid)
+                        r_pre[i] = slice_pre.r_latency[s_idx]
+                        m_pre[i] = slice_pre.mask_latency[s_idx]
+                if slice_pre.cov_U is not None and slice_pre.cov_U.size > 0:
+                    for i, cid_i in enumerate(self.active_canary_ids):
+                        if cid_i in slice_pre.canary_ids:
+                            idx_i = slice_pre.canary_ids.index(cid_i)
+                            for j, cid_j in enumerate(self.active_canary_ids):
+                                if cid_j in slice_pre.canary_ids:
+                                    idx_j = slice_pre.canary_ids.index(cid_j)
+                                    cov_pre[i, j] = slice_pre.cov_U[idx_i, idx_j]
+                self.lat_filter.step_preperiod(r_pre, m_pre, cov_pre)
+                self.lat_filter_indep.step_preperiod(r_pre, m_pre, cov_pre)
+                self.lat_filter_pooled.step_preperiod(r_pre, m_pre, cov_pre)
+
+            self.lat_filter.initialize_rollout()
+            self.lat_filter_indep.initialize_rollout()
+            self.lat_filter_pooled.initialize_rollout()
 
     def set_rollback(self, tick: int) -> None:
         """Record rollback event. Freezes further canary release alerts."""
@@ -618,6 +862,12 @@ class DetectorService:
             cov_U=cov_canaries,
         )
 
+        # Step comparison filters (Independent and Pooled SSM) for real-time shrinkage analysis
+        if hasattr(self, "lat_filter_indep") and self.lat_filter_indep is not None:
+            self.lat_filter_indep.step(r_latency=r_lat_canaries, obs_mask=mask_lat_canaries, cov_U=cov_canaries)
+        if hasattr(self, "lat_filter_pooled") and self.lat_filter_pooled is not None:
+            self.lat_filter_pooled.step(r_latency=r_lat_canaries, obs_mask=mask_lat_canaries, cov_U=cov_canaries)
+
         # Step 6: Memory Channel Update
         ctrl_recs = {
             s: contemp_recs[s] for s in self.expected_servers
@@ -691,6 +941,9 @@ class DetectorService:
         mean_c_eff = float(np.mean(a_hat)) if len(a_hat) else 0.0
         mean_c_se = float(np.mean(a_se)) if len(a_se) else 0.0
 
+        rel_score = float(max(score_lat, score_mem))
+        mon_state = SystemMonitoringState.MONITORING if self.frozen_policy.is_calibrated else SystemMonitoringState.UNCALIBRATED_POLICY
+
         tick_result = DetectorTickResult(
             tick=decision_tick,
             t0=self.t0,
@@ -703,11 +956,18 @@ class DetectorService:
             attribution=attribution,
             advisory_reason=advisory_reason,
             epistemic_disclaimer=self.frozen_policy.epistemic_disclaimer,
-            release_score=float(max(score_lat, score_mem)),
+            release_score=rel_score,
+            release_score_prob=round(float(math.exp(rel_score)), 4) if np.isfinite(rel_score) else 0.0,
             score_lat=score_lat,
             score_mem=score_mem,
             threshold_lat=self.frozen_policy.threshold_lat,
             threshold_mem=self.frozen_policy.threshold_mem,
+            threshold_lat_prob=round(float(math.exp(self.frozen_policy.threshold_lat)), 4),
+            threshold_mem_prob=round(float(math.exp(self.frozen_policy.threshold_mem)), 4),
+            threshold_scale=self.frozen_policy.threshold_scale,
+            monitoring_state=mon_state,
+            calibration_status=self.frozen_policy.calibration_status,
+            is_calibrated=self.frozen_policy.is_calibrated,
             first_alert_tick=self.first_alert_tick,
             hosts=hosts_evidence,
             class_effects=class_evidence,
@@ -832,6 +1092,9 @@ class DetectorService:
                 z = (eff - self.frozen_policy.kappa_lat) / se
                 risk = float(norm.sf(-z))
                 score = float(norm.logsf(-z))
+                eff_pct = (math.exp(eff) - 1.0) * 100.0 if np.isfinite(eff) else None
+                ci_lo_pct = (math.exp(eff - 1.96 * se) - 1.0) * 100.0 if np.isfinite(eff) and np.isfinite(se) else None
+                ci_hi_pct = (math.exp(eff + 1.96 * se) - 1.0) * 100.0 if np.isfinite(eff) and np.isfinite(se) else None
                 g_rate = float(mem_res.growth_rate_estimates[idx]) if idx < len(mem_res.growth_rate_estimates) else None
                 g_se = float(mem_res.growth_rate_se[idx]) if idx < len(mem_res.growth_rate_se) else None
                 headroom = float(mem_res.host_headroom_mb[idx]) if idx < len(mem_res.host_headroom_mb) else None
@@ -839,7 +1102,7 @@ class DetectorService:
                 guard = mem_res.guardrail_status
                 persist = mem_res.is_persistent_leak
             else:
-                eff = se = risk = score = g_rate = g_se = headroom = tte = None
+                eff = se = risk = score = eff_pct = ci_lo_pct = ci_hi_pct = g_rate = g_se = headroom = tte = None
                 guard = "NORMAL"
                 persist = False
 
@@ -852,6 +1115,9 @@ class DetectorService:
                 latency_se=se,
                 latency_ci_lower=eff - 1.96 * se if eff is not None and se is not None else None,
                 latency_ci_upper=eff + 1.96 * se if eff is not None and se is not None else None,
+                latency_effect_pct=eff_pct,
+                latency_ci_lower_pct=ci_lo_pct,
+                latency_ci_upper_pct=ci_hi_pct,
                 host_risk=risk,
                 host_log_score=score,
                 memory_drift_mb_per_min=g_rate,
@@ -879,7 +1145,7 @@ class DetectorService:
         contemp_recs: dict[str, TelemetryRecord],
         time_slice: TimeSlice | None = None,
     ) -> DetectorTickResult:
-        """Build null result when no canary is actively deployed or release is rolled back."""
+        """Build null result when no canary is actively deployed, release is rolled back, or awaiting data."""
         hosts = {}
         for sid in self.expected_servers:
             rec = contemp_recs.get(sid)
@@ -896,6 +1162,21 @@ class DetectorService:
                 request_count=rec.request_count if rec else 0,
                 observed=rec.observed if rec else False,
             )
+
+        # Distinguish truly uninitialized state from post-rollback or healthy baseline
+        if not contemp_recs:
+            mon_state = SystemMonitoringState.WAITING_FOR_DATA
+            infra_adv = "WAITING_FOR_DATA"
+            release_adv = "WAITING_FOR_DATA"
+            attribution = "WAITING_FOR_DATA"
+            adv_reason = "Awaiting initial simulation telemetry slice."
+        elif self.is_rolled_back:
+            mon_state = SystemMonitoringState.MONITORING
+            adv_reason = f"Release was rolled back at tick {self.rollback_tick}. | {infra_reason}"
+        else:
+            mon_state = SystemMonitoringState.MONITORING
+            adv_reason = f"No active canary release deployed. | {infra_reason}"
+
         return DetectorTickResult(
             tick=tick,
             t0=self.t0,
@@ -906,13 +1187,20 @@ class DetectorService:
             infrastructure_advisory=infra_adv,
             canary_release_advisory=release_adv,
             attribution=attribution,
-            advisory_reason=f"No active canary release deployed. | {infra_reason}",
+            advisory_reason=adv_reason,
             epistemic_disclaimer=self.frozen_policy.epistemic_disclaimer,
-            release_score=0.0,
+            release_score=None,
+            release_score_prob=None,
             score_lat=None,
             score_mem=None,
             threshold_lat=self.frozen_policy.threshold_lat,
             threshold_mem=self.frozen_policy.threshold_mem,
+            threshold_lat_prob=round(float(math.exp(self.frozen_policy.threshold_lat)), 4),
+            threshold_mem_prob=round(float(math.exp(self.frozen_policy.threshold_mem)), 4),
+            threshold_scale=self.frozen_policy.threshold_scale,
+            monitoring_state=mon_state,
+            calibration_status=self.frozen_policy.calibration_status,
+            is_calibrated=self.frozen_policy.is_calibrated,
             first_alert_tick=None,
             hosts=hosts,
             class_effects=[],
@@ -967,10 +1255,17 @@ class DetectorService:
             advisory_reason=f"IDENTIFIABILITY_GUARD: Confounded allocation - {ident_reason}. Release cause attribution is strictly prohibited without concurrent same-rack controls.",
             epistemic_disclaimer=self.frozen_policy.epistemic_disclaimer,
             release_score=None,
+            release_score_prob=None,
             score_lat=None,
             score_mem=None,
             threshold_lat=self.frozen_policy.threshold_lat,
             threshold_mem=self.frozen_policy.threshold_mem,
+            threshold_lat_prob=round(float(math.exp(self.frozen_policy.threshold_lat)), 4),
+            threshold_mem_prob=round(float(math.exp(self.frozen_policy.threshold_mem)), 4),
+            threshold_scale=self.frozen_policy.threshold_scale,
+            monitoring_state=SystemMonitoringState.INSUFFICIENT_DATA,
+            calibration_status=self.frozen_policy.calibration_status,
+            is_calibrated=self.frozen_policy.is_calibrated,
             first_alert_tick=self.first_alert_tick,
             hosts=hosts,
             class_effects=[],
@@ -998,13 +1293,22 @@ class DetectorService:
                 "ssm_connected": False,
                 "model_id": self.frozen_policy.model_id,
                 "policy_id": self.frozen_policy.policy_id,
+                "monitoring_state": SystemMonitoringState.CONNECTION_ERROR,
+                "calibration_status": self.frozen_policy.calibration_status,
+                "is_calibrated": self.frozen_policy.is_calibrated,
+                "threshold_scale": self.frozen_policy.threshold_scale,
                 "tick": latest.tick if latest else 0,
                 "canary_release_advisory": "DETECTOR NOT CONNECTED",
-                "infrastructure_advisory": latest.infrastructure_advisory if latest else "NORMAL",
+                "infrastructure_advisory": latest.infrastructure_advisory if latest else "DETECTOR NOT CONNECTED",
                 "attribution": "INSUFFICIENT_DATA",
                 "release_score": None,
+                "release_score_prob": None,
                 "threshold_lat": self.frozen_policy.threshold_lat,
                 "threshold_mem": self.frozen_policy.threshold_mem,
+                "threshold_lat_prob": round(float(math.exp(self.frozen_policy.threshold_lat)), 4),
+                "threshold_mem_prob": round(float(math.exp(self.frozen_policy.threshold_mem)), 4),
+                "evaluation_horizon": self.frozen_policy.evaluation_horizon,
+                "achieved_far": self.frozen_policy.achieved_far,
                 "first_alert_tick": None,
                 "advisory_reason": "DETECTOR NOT CONNECTED: Hierarchical SSM is offline or pending connection. Telemetry stream remains visible.",
                 "data_eligibility": {
@@ -1024,13 +1328,22 @@ class DetectorService:
                 "ssm_connected": True,
                 "model_id": self.frozen_policy.model_id,
                 "policy_id": self.frozen_policy.policy_id,
+                "monitoring_state": SystemMonitoringState.WAITING_FOR_DATA,
+                "calibration_status": self.frozen_policy.calibration_status,
+                "is_calibrated": self.frozen_policy.is_calibrated,
+                "threshold_scale": self.frozen_policy.threshold_scale,
                 "tick": 0,
-                "canary_release_advisory": "RUNNING",
-                "infrastructure_advisory": "NORMAL",
-                "attribution": "NORMAL",
-                "release_score": 0.0,
+                "canary_release_advisory": "WAITING_FOR_DATA",
+                "infrastructure_advisory": "WAITING_FOR_DATA",
+                "attribution": "WAITING_FOR_DATA",
+                "release_score": None,
+                "release_score_prob": None,
                 "threshold_lat": self.frozen_policy.threshold_lat,
                 "threshold_mem": self.frozen_policy.threshold_mem,
+                "threshold_lat_prob": round(float(math.exp(self.frozen_policy.threshold_lat)), 4),
+                "threshold_mem_prob": round(float(math.exp(self.frozen_policy.threshold_mem)), 4),
+                "evaluation_horizon": self.frozen_policy.evaluation_horizon,
+                "achieved_far": self.frozen_policy.achieved_far,
                 "first_alert_tick": None,
                 "advisory_reason": "Awaiting initial simulation telemetry slice.",
                 "data_eligibility": {
@@ -1049,16 +1362,25 @@ class DetectorService:
                 "ssm_connected": True,
                 "model_id": self.frozen_policy.model_id,
                 "policy_id": self.frozen_policy.policy_id,
+                "monitoring_state": SystemMonitoringState.MONITORING,
+                "calibration_status": self.frozen_policy.calibration_status,
+                "is_calibrated": self.frozen_policy.is_calibrated,
+                "threshold_scale": self.frozen_policy.threshold_scale,
                 "tick": latest.tick,
                 "t0": self.t0,
                 "canary_release_advisory": "ROLLED BACK",
                 "infrastructure_advisory": latest.infrastructure_advisory,
                 "attribution": "ROLLED_BACK",
-                "release_score": 0.0,
+                "release_score": None,
+                "release_score_prob": None,
                 "score_lat": None,
                 "score_mem": None,
                 "threshold_lat": self.frozen_policy.threshold_lat,
                 "threshold_mem": self.frozen_policy.threshold_mem,
+                "threshold_lat_prob": round(float(math.exp(self.frozen_policy.threshold_lat)), 4),
+                "threshold_mem_prob": round(float(math.exp(self.frozen_policy.threshold_mem)), 4),
+                "evaluation_horizon": self.frozen_policy.evaluation_horizon,
+                "achieved_far": self.frozen_policy.achieved_far,
                 "first_alert_tick": self.first_alert_tick,
                 "advisory_reason": f"Release was rolled back at tick {self.rollback_tick}. | {latest.infrastructure_advisory}",
                 "data_eligibility": {
@@ -1071,20 +1393,37 @@ class DetectorService:
                 "intervention_tick": self.intervention_tick,
             }
 
+        # Determine active monitoring state
+        if latest.is_unidentifiable or not latest.eligible:
+            mon_state = SystemMonitoringState.INSUFFICIENT_DATA
+        elif not self.frozen_policy.is_calibrated:
+            mon_state = SystemMonitoringState.UNCALIBRATED_POLICY
+        else:
+            mon_state = SystemMonitoringState.MONITORING
+
         return {
             "ssm_connected": True,
             "model_id": self.frozen_policy.model_id,
             "policy_id": self.frozen_policy.policy_id,
+            "monitoring_state": mon_state,
+            "calibration_status": self.frozen_policy.calibration_status,
+            "is_calibrated": self.frozen_policy.is_calibrated,
+            "threshold_scale": self.frozen_policy.threshold_scale,
             "tick": latest.tick,
             "t0": latest.t0,
             "canary_release_advisory": latest.canary_release_advisory,
             "infrastructure_advisory": latest.infrastructure_advisory,
             "attribution": latest.attribution,
             "release_score": latest.release_score,
+            "release_score_prob": round(float(math.exp(latest.release_score)), 4) if latest.release_score is not None else None,
             "score_lat": latest.score_lat,
             "score_mem": latest.score_mem,
             "threshold_lat": latest.threshold_lat,
             "threshold_mem": latest.threshold_mem,
+            "threshold_lat_prob": round(float(math.exp(self.frozen_policy.threshold_lat)), 4),
+            "threshold_mem_prob": round(float(math.exp(self.frozen_policy.threshold_mem)), 4),
+            "evaluation_horizon": self.frozen_policy.evaluation_horizon,
+            "achieved_far": self.frozen_policy.achieved_far,
             "first_alert_tick": latest.first_alert_tick,
             "advisory_reason": latest.advisory_reason,
             "data_eligibility": {
@@ -1100,6 +1439,84 @@ class DetectorService:
             "auto_rollback_enabled": self.enable_auto_rollback,
             "auto_rollback_triggered": self.auto_rollback_triggered,
             "intervention_tick": self.intervention_tick,
+        }
+
+    def get_comparison_evidence(self) -> dict[str, Any]:
+        """Return side-by-side comparison of Hierarchical SSM, Independent SSM, and Complete Pooling."""
+        if not self.active_canary_ids or self.lat_filter is None:
+            return {
+                "active": False,
+                "reason": "No active canary deployment.",
+                "methods": {},
+            }
+
+        def format_filter_stats(flt: OnlineHierarchicalLatencyFilter, name: str, kind: str, description: str) -> dict[str, Any]:
+            if flt.kf is None:
+                return {"name": name, "kind": kind, "description": description, "active": False}
+            am = flt.L @ flt.kf.m[:flt.d] if hasattr(flt, "L") else np.zeros(flt.nc)
+            cov_mat = flt.L @ flt.kf.P[:flt.d, :flt.d] @ flt.L.T
+            av = np.maximum(np.diag(cov_mat), 1e-18)
+            ase = np.sqrt(av)
+            zz = (flt.kappa - am) / ase
+            probs = norm.sf(zz)
+            log_probs = norm.logsf(zz)
+            score = float(np.nanmax(log_probs)) if len(log_probs) else float("-inf")
+            max_risk = float(np.nanmax(probs)) if len(probs) else 0.0
+
+            hosts = []
+            for i, cid in enumerate(flt.canary_ids):
+                eff = float(am[i])
+                se = float(ase[i])
+                hosts.append({
+                    "server_id": cid,
+                    "effect": round(eff, 5),
+                    "effect_pct": round((np.exp(eff) - 1.0) * 100.0, 2),
+                    "se": round(se, 5),
+                    "risk": round(float(probs[i]), 4),
+                    "log_score": round(float(log_probs[i]), 4),
+                })
+
+            return {
+                "name": name,
+                "kind": kind,
+                "description": description,
+                "mean_effect": round(float(np.mean(am)), 5),
+                "mean_effect_pct": round((np.exp(float(np.mean(am))) - 1.0) * 100.0, 2),
+                "release_score": round(score, 4),
+                "release_risk": round(max_risk, 4),
+                "alert": bool(score > self.frozen_policy.threshold_lat),
+                "hosts": hosts,
+            }
+
+        methods = {
+            "hierarchical": format_filter_stats(
+                self.lat_filter,
+                name="Hierarchical SSM (Partial Pooling)",
+                kind="hier",
+                description="Shrinks host-level canary estimates toward their class mean via Helmert contrast basis. Balances noise reduction with host-level sensitivity.",
+            ),
+        }
+        if hasattr(self, "lat_filter_indep") and self.lat_filter_indep is not None:
+            methods["independent"] = format_filter_stats(
+                self.lat_filter_indep,
+                name="Independent SSM (No Pooling)",
+                kind="indep",
+                description="Estimates each canary host in total isolation. High estimation variance on small samples; zero cross-host shrinkage.",
+            )
+        if hasattr(self, "lat_filter_pooled") and self.lat_filter_pooled is not None:
+            methods["pooled"] = format_filter_stats(
+                self.lat_filter_pooled,
+                name="Pooled SSM (Complete Pooling)",
+                kind="pooled",
+                description="Forces all canaries to share a single common effect parameter. High power when harm is uniform, but completely washes out isolated single-host harm.",
+            )
+
+        return {
+            "active": True,
+            "canary_ids": list(self.active_canary_ids),
+            "threshold_lat": self.frozen_policy.threshold_lat,
+            "threshold_scale": self.frozen_policy.threshold_scale,
+            "methods": methods,
         }
 
     def get_evidence(self) -> dict[str, Any]:
