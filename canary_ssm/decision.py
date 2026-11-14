@@ -7,6 +7,8 @@ Advisory (reversible) policy exists only for the separate flicker experiment.
 from __future__ import annotations
 
 import math
+from dataclasses import dataclass
+from typing import Any
 
 import numpy as np
 from scipy.stats import beta
@@ -122,3 +124,117 @@ def calibrate_advisory(null_scores: list, null_elig: list, t0: int, alpha: float
     h_on = c["threshold"]
     h_off = h_on - hyst_frac * (h_on - med) if np.isfinite(h_on) else h_on
     return {"h_on": h_on, "h_off": float(h_off), "hyst_frac": hyst_frac, "n_clear": 5, "base": c}
+
+
+@dataclass
+class MultiChannelAlertPolicy:
+    """Multi-channel alert decision rule combining Latency and Memory channels."""
+    threshold_lat: float
+    threshold_mem: float
+    require_persistence: bool = True
+    alpha: float = 0.05
+    disclaimer: str = (
+        "Multi-channel policy: Latency and Memory channels are separately evaluated. "
+        "Cross-metric covariance is treated separately rather than assuming joint dynamics."
+    )
+
+    def evaluate_step(
+        self,
+        score_lat: float,
+        score_mem: float,
+        guardrail_status: str = "NORMAL",
+        is_persistent_mem: bool = False,
+        eligible: bool = True,
+    ) -> dict[str, Any]:
+        """Evaluate multi-channel alert and determine attribution at a single tick."""
+        if not eligible or not (np.isfinite(score_lat) or np.isfinite(score_mem)):
+            return {
+                "is_alert": False,
+                "advisory": "RUNNING",
+                "attribution": "INSUFFICIENT_DATA",
+                "score_lat": score_lat,
+                "score_mem": score_mem,
+                "threshold_lat": self.threshold_lat,
+                "threshold_mem": self.threshold_mem,
+                "guardrail_status": guardrail_status,
+                "is_persistent_mem": is_persistent_mem,
+            }
+
+        lat_breach = np.isfinite(score_lat) and (score_lat > self.threshold_lat)
+        mem_score_breach = np.isfinite(score_mem) and (score_mem > self.threshold_mem)
+        mem_breach = mem_score_breach and (is_persistent_mem if self.require_persistence else True)
+        oom_risk = (guardrail_status == "CRITICAL_OOM_RISK")
+
+        is_alert = lat_breach or mem_breach or oom_risk
+
+        if oom_risk:
+            attribution = "CRITICAL_CAPACITY_LIMIT"
+            advisory = "CRITICAL_OOM_RISK"
+        elif lat_breach and mem_breach:
+            attribution = "COMPOUND_REGRESSION"
+            advisory = "PAUSE RECOMMENDED"
+        elif lat_breach:
+            attribution = "LATENCY_REGRESSION"
+            advisory = "PAUSE RECOMMENDED"
+        elif mem_breach:
+            attribution = "MEMORY_GROWTH_LEAK"
+            advisory = "PAUSE RECOMMENDED"
+        else:
+            attribution = "NORMAL"
+            advisory = "RUNNING"
+
+        return {
+            "is_alert": is_alert,
+            "advisory": advisory,
+            "attribution": attribution,
+            "score_lat": float(score_lat),
+            "score_mem": float(score_mem),
+            "threshold_lat": float(self.threshold_lat),
+            "threshold_mem": float(self.threshold_mem),
+            "lat_breach": bool(lat_breach),
+            "mem_breach": bool(mem_breach),
+            "mem_score_breach": bool(mem_score_breach),
+            "is_persistent_mem": bool(is_persistent_mem),
+            "guardrail_status": guardrail_status,
+            "disclaimer": self.disclaimer,
+        }
+
+
+def calibrate_multichannel_policy(
+    null_lat_maxima: np.ndarray,
+    null_mem_maxima: np.ndarray,
+    alpha: float = 0.05,
+) -> dict[str, Any]:
+    """Calibrate joint latency and memory thresholds on healthy null data to bound FWER <= alpha.
+
+    Uses Bonferroni-Šidák split: alpha_channel = 1 - sqrt(1 - alpha) approx alpha / 2.
+    """
+    lat_m = np.asarray(null_lat_maxima, float)
+    mem_m = np.asarray(null_mem_maxima, float)
+    B = len(lat_m)
+    if B != len(mem_m):
+        raise ValueError(f"Mismatched sample sizes: {B} vs {len(mem_m)}")
+
+    alpha_channel = 1.0 - math.sqrt(max(1.0 - alpha, 0.0))
+    cal_lat = calibrate_threshold(lat_m, alpha_channel)
+    cal_mem = calibrate_threshold(mem_m, alpha_channel)
+
+    thr_lat = cal_lat["threshold"]
+    thr_mem = cal_mem["threshold"]
+
+    # Empirical false alert rate under joint policy
+    joint_false_alarms = np.sum((lat_m > thr_lat) | (mem_m > thr_mem))
+    achieved_far = float(joint_false_alarms) / float(B) if B > 0 else 0.0
+
+    return {
+        "threshold_lat": thr_lat,
+        "threshold_mem": thr_mem,
+        "alpha_budget": alpha,
+        "alpha_channel": alpha_channel,
+        "achieved_far": achieved_far,
+        "calibration_successful": bool(achieved_far <= alpha),
+        "B": B,
+        "cal_lat": cal_lat,
+        "cal_mem": cal_mem,
+        "policy": MultiChannelAlertPolicy(threshold_lat=thr_lat, threshold_mem=thr_mem, alpha=alpha),
+    }

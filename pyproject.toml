@@ -17,7 +17,7 @@ report = ["tabulate>=0.9"]
 canary-ssm = "canary_ssm.cli:main"
 
 [tool.setuptools]
-packages = ["canary_ssm", "canary_ssm.studies"]
+packages = ["canary_ssm", "canary_ssm.studies", "canary_ssm.world", "canary_ssm.telemetry", "canary_ssm.faults", "canary_ssm.deployments", "canary_ssm.api"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
