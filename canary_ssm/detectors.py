@@ -33,7 +33,7 @@ from scipy.stats import norm
 
 from .baselines import DetectorOutput
 from .factor import Adjusted
-from .hierarchy import EffectParams, build_model, class_structure
+from .hierarchy import EffectParams, build_model, class_structure, effect_prior_variance
 from .kalman import KalmanFilter
 from .preprocess import Nuisance
 from .schema import KAPPA
@@ -312,8 +312,8 @@ class StreamingSSMDetector(StreamingDetector):
         self.kappa = float(kappa)
         self.params = {"kind": kind, "rho_g": params.rho_g, "sd_g": params.sd_g, "prior_sd": params.prior_sd}
 
-        # Model matrices from build_model
         p_copy = EffectParams(**{**params.__dict__, "kind": kind})
+        self.params_obj = p_copy
         self.L, self.rho, self.sd = build_model(p_copy, self.class_id)
         self.d = self.L.shape[1]
         if self.kind == "hier":
@@ -394,7 +394,8 @@ class StreamingSSMDetector(StreamingDetector):
             F = block_diag(np.diag(self.rho), np.diag(self.phi))
             Q = block_diag(np.diag(self.sd ** 2), np.diag(self.qe ** 2))
             m0 = np.r_[np.zeros(self.d), self.kn.m]
-            P0 = block_diag(np.eye(self.d) * (self.params_obj.prior_sd ** 2), self.kn.P)
+            p0_eff = effect_prior_variance(self.params_obj, self.class_id)
+            P0 = block_diag(np.diag(p0_eff), self.kn.P)
             self.kf = KalmanFilter(F, Q, m0, P0)
 
         # -------------------------------------------------------------

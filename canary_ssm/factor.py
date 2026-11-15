@@ -177,22 +177,37 @@ def adjust(roll: Rollout, x_center: float, class_lambda: np.ndarray, factor_rank
                 if w_rack[rk_i] > 0:
                     gamma_hat_arr[t, rk_i] = raw_gamma[rk_i] - mean_g
 
-            # Build full estimation error covariance matrix for canaries
+            # Build full estimation error covariance matrix for canaries (exact closed-form)
+            bar_lam_rack = np.zeros(n_racks)
+            for rk_i, rk in enumerate(unique_racks):
+                rk_ctl_mask = (ctl_racks == rk) & ctl_ok[t]
+                if rk_ctl_mask.any() and w_rack[rk_i] > 1e-9:
+                    ctl_pos = np.flatnonzero(rk_ctl_mask)
+                    bar_lam_rack[rk_i] = float(((1.0 / sig2[ctl_pos]) * lamC[ctl_pos]).sum() / w_rack[rk_i])
+                else:
+                    bar_lam_rack[rk_i] = 1.0
+
+            bar_lam_fleet = float((w_rack * bar_lam_rack).sum() / w_tot) if w_tot > 1e-9 else 1.0
+            delta_lam = bar_lam_rack - bar_lam_fleet
+            inv_w_tot = (1.0 / w_tot) if w_tot > 1e-9 else 0.0
+
             for i1 in range(nc):
                 rk_idx1 = can_rack_indices[i1]
                 lam1 = lam[i1]
-                ctls1_pos = np.flatnonzero((ctl_racks == unique_racks[rk_idx1]) & ctl_ok[t])
-                bar_lam1 = float(lamC[ctls1_pos].mean()) if len(ctls1_pos) > 0 else 1.0
+                d_lam1 = delta_lam[rk_idx1]
 
                 for i2 in range(nc):
                     rk_idx2 = can_rack_indices[i2]
                     lam2 = lam[i2]
+                    d_lam2 = delta_lam[rk_idx2]
+
+                    c_val = (lam1 * lam2 - d_lam1 * d_lam2) * u_f - inv_w_tot
                     if rk_idx1 == rk_idx2:
-                        cov_U_arr[t, i1, i2] = U_rack_arr[t, rk_idx1] + (lam1 * lam2 - bar_lam1 ** 2) * u_f
-                    else:
-                        cov_U_arr[t, i1, i2] = lam1 * lam2 * u_f
+                        c_val += U_rack_arr[t, rk_idx1]
+                    cov_U_arr[t, i1, i2] = c_val
 
                 cov_U_arr[t, i1, i1] = max(cov_U_arr[t, i1, i1], 0.0)
+            cov_U_arr[t] = 0.5 * (cov_U_arr[t] + cov_U_arr[t].T)
 
         # Subtract both fleet factor and rack nuisance
         g_for_can = np.array([gamma_hat_arr[:, rack_to_idx[rk]] for rk in can_racks]).T

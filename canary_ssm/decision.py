@@ -46,9 +46,9 @@ def threshold_uncertainty(
     seed: int = 0,
 ) -> dict:
     """Order-statistic threshold sampling uncertainty & exact Beta quantiles for achieved FAR (WP-C2)."""
-    m = np.sort(np.asarray(maxima, float))
+    cal = calibrate_threshold(maxima, alpha)
+    m = np.sort(np.asarray(maxima, float)[np.isfinite(maxima)])
     B = len(m)
-    cal = calibrate_threshold(m, alpha)
     k = int(cal["k"])
     rng = np.random.default_rng(seed)
     boot_thrs = np.empty(n_boot, dtype=float)
@@ -76,14 +76,36 @@ def threshold_uncertainty(
         "far_beta_hi": far_hi,
         "beta_a": a_b,
         "beta_b": b_b,
+        "n_no_eligible": int(cal["n_no_eligible"]),
+        "n_finite_maxima": int(cal["n_finite_maxima"]),
     }
 
 
-def calibrate_threshold(maxima: np.ndarray, alpha: float = 0.05) -> dict:
-    M = np.sort(np.asarray(maxima, float)); B = len(M)
-    k = math.ceil((B + 1) * (1 - alpha))
-    thr = float("inf") if k > B else float(M[k - 1])
-    return {"threshold": thr, "k": k, "B": B, "alpha": alpha, "ties_at_threshold": int((M == thr).sum())}
+def calibrate_threshold(maxima: np.ndarray, alpha: float = 0.05, strict: bool = False) -> dict:
+    M_raw = np.asarray(maxima, float)
+    B_total = len(M_raw)
+    finite_mask = np.isfinite(M_raw) & (~np.isneginf(M_raw))
+    n_no_eligible = int(np.sum(~finite_mask))
+    n_finite_maxima = int(np.sum(finite_mask))
+
+    min_B = min_B_for_alpha(alpha)
+    if strict and n_finite_maxima < min_B:
+        raise ValueError(f"insufficient valid nulls ({n_finite_maxima} < {min_B}) for alpha={alpha}")
+
+    valid_M = np.sort(M_raw[finite_mask])
+    B_valid = len(valid_M)
+    k = math.ceil((B_valid + 1) * (1.0 - alpha))
+    thr = float("inf") if k > B_valid else float(valid_M[k - 1])
+    return {
+        "threshold": thr,
+        "k": k,
+        "B": B_valid,
+        "alpha": alpha,
+        "ties_at_threshold": int((valid_M == thr).sum()) if np.isfinite(thr) else 0,
+        "n_no_eligible": n_no_eligible,
+        "n_finite_maxima": n_finite_maxima,
+        "B_total": B_total,
+    }
 
 
 def first_alarm(score: np.ndarray, elig: np.ndarray, thr: float, t0: int) -> int | None:

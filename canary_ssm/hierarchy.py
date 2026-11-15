@@ -33,6 +33,8 @@ class EffectParams:
     sd_h_ratio: float = 1.0       # local-deviation SD relative to sd_g
     prior_sd: float = 0.03        # proper effect prior SD at rollout onset
     huber_c: float = 0.0          # >0: winsorise residuals at +-c pre-period SDs (heavy-tail robustness)
+    prior_mode: str = "legacy"    # legacy | ratio_scaled
+    variance_mode: str = "legacy" # legacy | matched | variance_matched
 
 
 def long_run_sd(p: "EffectParams") -> float:
@@ -83,6 +85,54 @@ def class_structure(class_id: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     return C, B
 
 
+def effect_prior_variance(p: EffectParams, class_id: np.ndarray) -> np.ndarray:
+    """Return 1D array of prior variances for each effect state in build_model.
+
+    Under legacy mode:
+        All effect states have variance prior_sd^2.
+    Under ratio_scaled mode (with legacy variance):
+        theta states have variance prior_sd^2.
+        b deviation states have variance (prior_sd * sd_h_ratio)^2.
+    Under variance_matched mode:
+        For class g of size m_g:
+            c_g^2 = 1.0 / (1.0 + sd_h_ratio^2 * (m_g - 1) / m_g) if m_g > 1 else 1.0
+            theta_g has variance c_g^2 * prior_sd^2
+            b_g states have variance c_g^2 * (prior_sd * sd_h_ratio)^2
+        Guarantees diag(L @ P0_eff @ L^T) == prior_sd^2 for every host.
+    """
+    class_id = np.asarray(class_id)
+    n = len(class_id)
+    if p.kind != "hier":
+        d = 1 if p.kind == "pooled" else n
+        return np.full(d, p.prior_sd ** 2, dtype=float)
+
+    C, B = class_structure(class_id)
+    G = C.shape[1]
+    n_b = B.shape[1]
+    d = G + n_b
+
+    is_vm = p.variance_mode in ("variance_matched", "matched")
+    if not is_vm and p.prior_mode == "legacy":
+        return np.full(d, p.prior_sd ** 2, dtype=float)
+
+    classes = np.unique(class_id)
+    tau = p.sd_h_ratio
+    p0_theta = []
+    p0_b = []
+
+    for g in classes:
+        m = int(np.count_nonzero(class_id == g))
+        if is_vm:
+            c_g2 = 1.0 / (1.0 + (tau ** 2) * (m - 1.0) / m) if m > 1 else 1.0
+        else:
+            c_g2 = 1.0
+        p0_theta.append(c_g2 * (p.prior_sd ** 2))
+        if m > 1:
+            p0_b.extend([c_g2 * ((p.prior_sd * tau) ** 2)] * (m - 1))
+
+    return np.r_[np.array(p0_theta, dtype=float), np.array(p0_b, dtype=float)]
+
+
 def implied_host_covariance(
     params: EffectParams,
     class_id: np.ndarray,
@@ -94,7 +144,7 @@ def implied_host_covariance(
     Cov(a) = Var(theta) * C C^T + Var(b) * B B^T
     
     Args:
-        params: EffectParams containing rho_g, rho_h, sd_g, sd_h_ratio.
+        params: EffectParams containing rho_g, rho_h, sd_g, sd_h_ratio, variance_mode.
         class_id: Array of class IDs for each host (length n).
         stationary: If True, uses stationary variances Var = sd^2 / (1 - rho^2).
                    If False, uses innovation variances Var = sd^2.
@@ -104,21 +154,51 @@ def implied_host_covariance(
     """
     class_id = np.asarray(class_id)
     n = len(class_id)
-    C, B = class_structure(class_id)
-    
+
     sd_g = params.sd_g
     sd_h = params.sd_g * params.sd_h_ratio
-    
+
     if stationary:
         var_theta = sd_g ** 2 / max(1.0 - params.rho_g ** 2, 1e-12)
         var_b = sd_h ** 2 / max(1.0 - params.rho_h ** 2, 1e-12)
     else:
         var_theta = sd_g ** 2
         var_b = sd_h ** 2
-        
-    cov_a = var_theta * (C @ C.T)
-    if B.shape[1] > 0:
-        cov_a = cov_a + var_b * (B @ B.T)
+
+    if params.kind == "indep":
+        cov_a = var_theta * np.eye(n)
+        corr_a = np.eye(n)
+        return cov_a, corr_a
+    elif params.kind == "pooled":
+        cov_a = var_theta * np.ones((n, n))
+        corr_a = np.ones((n, n))
+        return cov_a, corr_a
+
+    C, B = class_structure(class_id)
+    is_vm = params.variance_mode in ("variance_matched", "matched")
+    
+    if not is_vm:
+        cov_a = var_theta * (C @ C.T)
+        if B.shape[1] > 0:
+            cov_a = cov_a + var_b * (B @ B.T)
+    else:
+        classes = np.unique(class_id)
+        tau = params.sd_h_ratio
+        cov_a = np.zeros((n, n), dtype=float)
+        for g in classes:
+            idx = np.flatnonzero(class_id == g)
+            m = len(idx)
+            c_g2 = 1.0 / (1.0 + (tau ** 2) * (m - 1.0) / m) if m > 1 else 1.0
+            if stationary:
+                vt = c_g2 * (sd_g ** 2 / max(1.0 - params.rho_g ** 2, 1e-12))
+                vb = c_g2 * (sd_h ** 2 / max(1.0 - params.rho_h ** 2, 1e-12))
+            else:
+                vt = c_g2 * (sd_g ** 2)
+                vb = c_g2 * (sd_h ** 2)
+            cov_a[np.ix_(idx, idx)] += vt
+            if m > 1:
+                Bg = deterministic_helmert_basis(m)
+                cov_a[np.ix_(idx, idx)] += vb * (Bg @ Bg.T)
         
     diag_std = np.sqrt(np.maximum(np.diag(cov_a), 1e-18))
     corr_a = cov_a / np.outer(diag_std, diag_std)
@@ -141,7 +221,21 @@ def build_model(p: EffectParams, class_id: np.ndarray):
         C, B = class_structure(class_id)
         L = np.hstack([C, B])
         rho = np.r_[np.full(C.shape[1], p.rho_g), np.full(B.shape[1], p.rho_h)]
-        sd = np.r_[np.full(C.shape[1], p.sd_g), np.full(B.shape[1], p.sd_g * p.sd_h_ratio)]
+        is_vm = p.variance_mode in ("variance_matched", "matched")
+        if not is_vm:
+            sd = np.r_[np.full(C.shape[1], p.sd_g), np.full(B.shape[1], p.sd_g * p.sd_h_ratio)]
+        else:
+            classes = np.unique(class_id)
+            tau = p.sd_h_ratio
+            sd_theta = []
+            sd_b = []
+            for g in classes:
+                m = int(np.count_nonzero(class_id == g))
+                c_g = 1.0 / np.sqrt(1.0 + (tau ** 2) * (m - 1.0) / m) if m > 1 else 1.0
+                sd_theta.append(c_g * p.sd_g)
+                if m > 1:
+                    sd_b.extend([c_g * p.sd_g * tau] * (m - 1))
+            sd = np.r_[np.array(sd_theta, dtype=float), np.array(sd_b, dtype=float)]
     elif p.kind == "indep":
         L = np.eye(n); rho = np.full(n, p.rho_g); sd = np.full(n, p.sd_g)
     elif p.kind == "pooled":
@@ -187,7 +281,8 @@ class EffectDetector:
         # ---- rollout filter: effect prior reset to zero with proper diagonal variance ----
         F = block_diag(np.diag(rho), np.diag(phi)); Q = block_diag(np.diag(sd ** 2), np.diag(qe ** 2))
         m0 = np.r_[np.zeros(d), kn.m]
-        P0 = block_diag(np.eye(d) * self.p.prior_sd ** 2, kn.P)
+        p0_eff = effect_prior_variance(self.p, cls)
+        P0 = block_diag(np.diag(p0_eff), kn.P)
         kf = KalmanFilter(F, Q, m0, P0)
         H = np.hstack([L, np.eye(n)]); Lfull = np.hstack([L, np.zeros((n, n))])
         if self.p.kind == "hier":

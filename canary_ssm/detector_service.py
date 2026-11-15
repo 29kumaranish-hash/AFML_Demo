@@ -35,7 +35,7 @@ from scipy.linalg import block_diag, cho_factor, cho_solve
 from scipy.stats import norm
 
 from canary_ssm.decision import MultiChannelAlertPolicy
-from canary_ssm.hierarchy import EffectParams, class_structure, build_model
+from canary_ssm.hierarchy import EffectParams, class_structure, build_model, effect_prior_variance
 from canary_ssm.kalman import KalmanFilter, symmetrize
 from canary_ssm.memory import (
     MemoryStepResult,
@@ -854,7 +854,8 @@ class OnlineHierarchicalLatencyFilter:
         F = block_diag(np.diag(self.rho), np.diag(self.phi))
         Q = block_diag(np.diag(self.sd ** 2), np.diag(self.qe ** 2))
         m0 = np.r_[np.zeros(self.d), self.kn.m]
-        P0 = block_diag(np.eye(self.d) * (self.p.prior_sd ** 2), self.kn.P)
+        p0_eff = effect_prior_variance(self.p, self.canary_classes)
+        P0 = block_diag(np.diag(p0_eff), self.kn.P)
         self.kf = KalmanFilter(F, Q, m0, P0)
         self.is_rollout_initialized = True
 
