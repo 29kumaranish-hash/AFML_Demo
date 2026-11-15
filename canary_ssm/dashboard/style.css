@@ -257,6 +257,28 @@ main {
   justify-content: space-between;
 }
 
+.model-status-panel {
+  background: linear-gradient(120deg, rgba(56, 189, 248, 0.12), rgba(168, 85, 247, 0.10));
+  border: 1px solid rgba(56, 189, 248, 0.35);
+  border-radius: 8px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+  margin: 1rem 0 1.25rem;
+  padding: 1rem 1.25rem;
+}
+.model-status-label { display: block; color: var(--accent-blue); font-size: 0.72rem; font-weight: 700; letter-spacing: 0.06em; text-transform: uppercase; }
+.model-status-panel strong { display: block; margin: 0.2rem 0; }
+.model-status-panel p { color: var(--text-secondary); font-size: 0.82rem; max-width: 850px; }
+.audit-summary-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 0.8rem; }
+.audit-summary-grid > div { background: var(--bg-primary); border: 1px solid var(--border-color); border-radius: 6px; padding: 0.9rem; color: var(--text-secondary); font-size: 0.82rem; }
+.audit-summary-grid strong { color: var(--text-primary); }
+@media (max-width: 900px) {
+  .model-status-panel { align-items: flex-start; flex-direction: column; }
+  .audit-summary-grid { grid-template-columns: 1fr; }
+}
+
 /* Rack & Server Cards */
 .rack-card {
   background-color: var(--card-bg);

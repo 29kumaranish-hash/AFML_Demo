@@ -12,6 +12,7 @@ let isConnected = true;
 let isReplaying = false;
 let replayTimer = null;
 let currentReplayIndex = 0;
+let lastStatus = null;
 
 // Initialize Dashboard
 document.addEventListener("DOMContentLoaded", () => {
@@ -21,6 +22,9 @@ document.addEventListener("DOMContentLoaded", () => {
   setupReleasesPage();
   setupFaultLabPage();
   setupEvaluationPage();
+  document.getElementById("btn-open-evidence")?.addEventListener("click", () => {
+    document.querySelector('.tab-btn[data-tab="evidence"]')?.click();
+  });
   loadPresetsCatalog();
 
   // Initial refresh and periodic polling (every 1s)
@@ -164,7 +168,9 @@ function setupQuickStart() {
   });
 
   document.getElementById("btn-filter-calibrated")?.addEventListener("click", () => {
-    showToast("Calibrated Policy (FAR=0.05, N=2000) active with log-scale thresholds.", "info");
+    const policy = lastStatus?.policy_id || "No policy loaded";
+    const state = lastStatus?.is_calibrated ? "calibrated" : "exploratory or unverified";
+    showToast(`${policy}: ${state}. Check the Audit tab for scope and limitations.`, "info");
   });
 }
 
@@ -253,6 +259,7 @@ async function refreshAll() {
 }
 
 function updateControlBar(status) {
+  lastStatus = status;
   const tickEl = document.getElementById("clock-tick");
   const pauseStatusEl = document.getElementById("clock-status");
   const freshnessEl = document.getElementById("data-freshness");
@@ -285,11 +292,50 @@ function updateControlBar(status) {
   const calBadge = document.getElementById("policy-calibration-badge");
   if (calBadge) {
     if (status.is_calibrated) {
-      calBadge.textContent = "Calibrated Policy (FAR=0.05, N=2000)";
+      calBadge.textContent = "Calibrated Policy (Gate G2 PASS)";
       calBadge.className = "badge badge-canary";
+    } else if (status.artifact_rejection_reasons && status.artifact_rejection_reasons.length > 0 && status.calibration_status !== "UNVALIDATED_EXPLORATORY") {
+      calBadge.textContent = "Policy Rejected (Incompatible)";
+      calBadge.className = "badge badge-danger";
     } else {
       calBadge.textContent = "Uncalibrated Exploratory";
       calBadge.className = "badge badge-warning";
+    }
+  }
+
+  const regimeBadge = document.getElementById("policy-regime-badge");
+  if (regimeBadge) {
+    regimeBadge.textContent = `Regime: ${status.regime || "plain"}`;
+    regimeBadge.className = status.regime === "step" ? "badge badge-warning" : "badge badge-info";
+  }
+
+  const modelTitle = document.getElementById("model-status-title");
+  const modelDetail = document.getElementById("model-status-detail");
+  const incompatEl = document.getElementById("model-status-incompatibility");
+  if (modelTitle && modelDetail) {
+    const model = status.model_id || "No detector model";
+    const policy = status.policy_id || "No policy";
+    const regime = status.regime || "plain";
+    const policyState = status.is_calibrated
+      ? "Calibrated (Gate G2 PASS)"
+      : (status.calibration_status === "FAILED_CALIBRATION" ? "Policy Rejected" : "Uncalibrated Exploratory");
+    modelTitle.textContent = `${model} | Policy: ${policy} | Regime: ${regime} - ${policyState}`;
+
+    if (status.is_calibrated) {
+      const latThr = Number.isFinite(status.threshold_lat) ? status.threshold_lat.toFixed(3) : "N/A";
+      const memThr = Number.isFinite(status.threshold_mem) ? status.threshold_mem.toFixed(3) : "N/A";
+      modelDetail.textContent = `Live inference uses a causal hierarchical Kalman filter with class and host states. Validated policy loaded (Gate G2 PASS, regime: ${regime}). Thresholds: latency=${latThr}, memory=${memThr}. The release score ranks max host posterior risk within declared scope.`;
+    } else {
+      modelDetail.textContent = `Live inference uses a causal hierarchical Kalman filter with class and host states. Running in uncalibrated exploratory mode. Scores are diagnostic only; not calibrated for fleet-wide false-alert control.`;
+    }
+
+    if (incompatEl) {
+      if (status.artifact_rejection_reasons && status.artifact_rejection_reasons.length > 0) {
+        incompatEl.style.display = "block";
+        incompatEl.textContent = `Incompatibility / Audit Note: ${status.artifact_rejection_reasons[0]}`;
+      } else {
+        incompatEl.style.display = "none";
+      }
     }
   }
 
@@ -1712,8 +1758,8 @@ async function renderComparisonView() {
   const comp = await apiGet("/api/detector/compare-methods");
   if (!comp || !comp.methods) return;
 
-  const hier = comp.methods.hier || {};
-  const indep = comp.methods.indep || {};
+  const hier = comp.methods.hierarchical || {};
+  const indep = comp.methods.independent || {};
   const pooled = comp.methods.pooled || {};
 
   // Hierarchical Card
@@ -1722,12 +1768,12 @@ async function renderComparisonView() {
   const hierRiskEl = document.getElementById("comp-hier-risk");
   const hierAdvEl = document.getElementById("comp-hier-advisory");
 
-  if (hierEffEl) hierEffEl.textContent = `${(hier.mean_effect_pct || 0).toFixed(2)}% (SE: ${(hier.se || 0).toFixed(4)})`;
-  if (hierScoreEl) hierScoreEl.textContent = hier.release_score !== null ? hier.release_score.toFixed(3) : "Pending";
-  if (hierRiskEl) hierRiskEl.textContent = hier.max_risk !== null ? `${(hier.max_risk * 100).toFixed(1)}%` : "N/A";
+  if (hierEffEl) hierEffEl.textContent = `${(hier.mean_effect_pct || 0).toFixed(2)}%`;
+  if (hierScoreEl) hierScoreEl.textContent = Number.isFinite(hier.release_score) ? hier.release_score.toFixed(3) : "Pending";
+  if (hierRiskEl) hierRiskEl.textContent = hier.release_risk !== null && hier.release_risk !== undefined ? `${(hier.release_risk * 100).toFixed(1)}%` : "N/A";
   if (hierAdvEl) {
-    hierAdvEl.textContent = hier.advisory || "WAITING";
-    hierAdvEl.className = "advisory-pill " + (hier.advisory === "PAUSE RECOMMENDED" ? "pill-danger" : hier.advisory === "NORMAL" ? "pill-normal" : "pill-neutral");
+    hierAdvEl.textContent = hier.calibration_status || "WAITING";
+    hierAdvEl.className = "advisory-pill " + (hier.calibration_status === "CALIBRATED" ? "pill-normal" : "pill-neutral");
   }
 
   // Independent Card
@@ -1736,12 +1782,12 @@ async function renderComparisonView() {
   const indepRiskEl = document.getElementById("comp-indep-risk");
   const indepAdvEl = document.getElementById("comp-indep-advisory");
 
-  if (indepEffEl) indepEffEl.textContent = `${(indep.mean_effect_pct || 0).toFixed(2)}% (SE: ${(indep.se || 0).toFixed(4)})`;
-  if (indepScoreEl) indepScoreEl.textContent = indep.release_score !== null ? indep.release_score.toFixed(3) : "Pending";
-  if (indepRiskEl) indepRiskEl.textContent = indep.max_risk !== null ? `${(indep.max_risk * 100).toFixed(1)}%` : "N/A";
+  if (indepEffEl) indepEffEl.textContent = `${(indep.mean_effect_pct || 0).toFixed(2)}%`;
+  if (indepScoreEl) indepScoreEl.textContent = Number.isFinite(indep.release_score) ? indep.release_score.toFixed(3) : "Pending";
+  if (indepRiskEl) indepRiskEl.textContent = indep.release_risk !== null && indep.release_risk !== undefined ? `${(indep.release_risk * 100).toFixed(1)}%` : "N/A";
   if (indepAdvEl) {
-    indepAdvEl.textContent = indep.advisory || "WAITING";
-    indepAdvEl.className = "advisory-pill " + (indep.advisory === "PAUSE RECOMMENDED" ? "pill-danger" : indep.advisory === "NORMAL" ? "pill-normal" : "pill-neutral");
+    indepAdvEl.textContent = indep.calibration_status || "WAITING";
+    indepAdvEl.className = "advisory-pill pill-neutral";
   }
 
   // Pooled Card
@@ -1750,22 +1796,26 @@ async function renderComparisonView() {
   const pooledRiskEl = document.getElementById("comp-pooled-risk");
   const pooledAdvEl = document.getElementById("comp-pooled-advisory");
 
-  if (pooledEffEl) pooledEffEl.textContent = `${(pooled.mean_effect_pct || 0).toFixed(2)}% (SE: ${(pooled.se || 0).toFixed(4)})`;
-  if (pooledScoreEl) pooledScoreEl.textContent = pooled.release_score !== null ? pooled.release_score.toFixed(3) : "Pending";
-  if (pooledRiskEl) pooledRiskEl.textContent = pooled.max_risk !== null ? `${(pooled.max_risk * 100).toFixed(1)}%` : "N/A";
+  if (pooledEffEl) pooledEffEl.textContent = `${(pooled.mean_effect_pct || 0).toFixed(2)}%`;
+  if (pooledScoreEl) pooledScoreEl.textContent = Number.isFinite(pooled.release_score) ? pooled.release_score.toFixed(3) : "Pending";
+  if (pooledRiskEl) pooledRiskEl.textContent = pooled.release_risk !== null && pooled.release_risk !== undefined ? `${(pooled.release_risk * 100).toFixed(1)}%` : "N/A";
   if (pooledAdvEl) {
-    pooledAdvEl.textContent = pooled.advisory || "WAITING";
-    pooledAdvEl.className = "advisory-pill " + (pooled.advisory === "PAUSE RECOMMENDED" ? "pill-danger" : pooled.advisory === "NORMAL" ? "pill-normal" : "pill-neutral");
+    pooledAdvEl.textContent = pooled.calibration_status || "WAITING";
+    pooledAdvEl.className = "advisory-pill pill-neutral";
   }
 
   // Table breakdown
   const compTableBody = document.getElementById("comparison-table-body");
   if (!compTableBody) return;
 
-  const hierHosts = hier.hosts || {};
-  const indepHosts = indep.hosts || {};
-  const pooledHosts = pooled.hosts || {};
-  const serverIds = Object.keys(hierHosts);
+  const hierHosts = Array.isArray(hier.hosts) ? hier.hosts : [];
+  const indepHosts = Array.isArray(indep.hosts) ? indep.hosts : [];
+  const pooledHosts = Array.isArray(pooled.hosts) ? pooled.hosts : [];
+  const hostsById = (hosts) => Object.fromEntries(hosts.map(host => [host.server_id, host]));
+  const hierById = hostsById(hierHosts);
+  const indepById = hostsById(indepHosts);
+  const pooledById = hostsById(pooledHosts);
+  const serverIds = Object.keys(hierById);
 
   if (serverIds.length === 0) {
     compTableBody.innerHTML = `<tr><td colspan="7" style="text-align: center; color: var(--text-muted);">Awaiting active comparison telemetry.</td></tr>`;
@@ -1774,9 +1824,9 @@ async function renderComparisonView() {
 
   compTableBody.innerHTML = "";
   serverIds.forEach(sid => {
-    const hH = hierHosts[sid] || {};
-    const iH = indepHosts[sid] || {};
-    const pH = pooledHosts[sid] || {};
+    const hH = hierById[sid] || {};
+    const iH = indepById[sid] || {};
+    const pH = pooledById[sid] || {};
 
     const row = document.createElement("tr");
     row.innerHTML = `

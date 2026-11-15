@@ -12,6 +12,8 @@ from __future__ import annotations
 
 import collections
 import math
+import os
+from pathlib import Path
 import threading
 import time
 from typing import Any
@@ -45,12 +47,17 @@ class SimulatorService:
         servers_per_rack: int = 6,
         seed: int = 42,
         ssm_connected: bool = True,
+        policy_artifact_path: str | Path | None = None,
+        regime: str = "plain",
     ) -> None:
         self.lock = threading.RLock()
         self.n_racks = n_racks
         self.servers_per_rack = servers_per_rack
         self.initial_seed = seed
         self.ssm_connected = bool(ssm_connected)
+        self.regime = regime
+
+        effective_artifact_path = policy_artifact_path or os.environ.get("CANARY_POLICY_ARTIFACT")
 
         # Initialize world and deployment manager
         self.world: VirtualWorld = VirtualWorld.create_default(
@@ -96,6 +103,8 @@ class SimulatorService:
         self.detector_service = DetectorService(
             expected_servers=list(server_meta.keys()),
             server_metadata=server_meta,
+            policy_artifact=effective_artifact_path,
+            regime=self.regime,
             ssm_connected=self.ssm_connected,
         )
 
@@ -251,13 +260,18 @@ class SimulatorService:
                 "infrastructure_advisory": adv["infrastructure_advisory"],
                 "canary_release_advisory": adv["canary_release_advisory"],
                 "monitoring_state": adv.get("monitoring_state", "MONITORING"),
-                "calibration_status": adv.get("calibration_status", "CALIBRATED"),
+                "calibration_status": adv.get("calibration_status", "UNVALIDATED_EXPLORATORY"),
                 "is_calibrated": adv.get("is_calibrated", False),
+                "gate_g2_status": adv.get("gate_g2_status", "NOT_EVALUATED"),
+                "artifact_path": adv.get("artifact_path"),
+                "artifact_hash": adv.get("artifact_hash"),
+                "artifact_rejection_reasons": adv.get("artifact_rejection_reasons", []),
                 "threshold_scale": adv.get("threshold_scale", "LOG_POSTERIOR_RISK"),
                 "advisory_reason": adv["advisory_reason"],
                 "ssm_connected": self.ssm_connected,
                 "model_id": adv.get("model_id"),
                 "policy_id": adv.get("policy_id"),
+                "regime": adv.get("regime", self.regime),
                 "release_score": adv.get("release_score"),
                 "release_score_prob": adv.get("release_score_prob"),
                 "alert_threshold": adv.get("alert_threshold"),
@@ -599,8 +613,12 @@ class SimulatorService:
             "infrastructure_advisory": det_status["infrastructure_advisory"],
             "canary_release_advisory": det_status["canary_release_advisory"],
             "monitoring_state": det_status.get("monitoring_state", "MONITORING"),
-            "calibration_status": det_status.get("calibration_status", "CALIBRATED"),
+            "calibration_status": det_status.get("calibration_status", "UNVALIDATED_EXPLORATORY"),
             "is_calibrated": det_status.get("is_calibrated", False),
+            "gate_g2_status": det_status.get("gate_g2_status", "NOT_EVALUATED"),
+            "artifact_path": det_status.get("artifact_path"),
+            "artifact_hash": det_status.get("artifact_hash"),
+            "artifact_rejection_reasons": det_status.get("artifact_rejection_reasons", []),
             "threshold_scale": det_status.get("threshold_scale", "LOG_POSTERIOR_RISK"),
             "release_score": det_status["release_score"],
             "release_score_prob": det_status.get("release_score_prob"),
@@ -609,6 +627,7 @@ class SimulatorService:
             "advisory_reason": det_status["advisory_reason"],
             "model_id": det_status["model_id"],
             "policy_id": det_status["policy_id"],
+            "regime": det_status.get("regime", self.regime),
             "data_eligibility": det_status["data_eligibility"],
             "first_alert_tick": det_status["first_alert_tick"],
             "epistemic_disclaimer": det_status["epistemic_disclaimer"],

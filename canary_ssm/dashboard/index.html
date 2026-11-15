@@ -68,7 +68,10 @@
         <span id="monitoring-state-pill" class="advisory-pill pill-neutral">WAITING_FOR_DATA</span>
       </div>
       <div>
-        <span id="policy-calibration-badge" class="badge badge-warning" title="Policy Calibration Status">Exploratory Policy</span>
+        <span id="policy-calibration-badge" class="badge badge-warning" title="Policy Calibration Status">Uncalibrated Exploratory</span>
+      </div>
+      <div>
+        <span id="policy-regime-badge" class="badge badge-info" title="Active Monitoring Regime">Regime: plain</span>
       </div>
       <label style="display: inline-flex; align-items: center; font-size: 0.75rem; color: var(--text-secondary); cursor: pointer;" title="Toggle connection to Hierarchical SSM detector">
         <input type="checkbox" id="cb-connect-detector" style="margin-right: 0.25rem;" checked>
@@ -124,6 +127,16 @@
             </button>
           </div>
         </div>
+      </div>
+
+      <div class="model-status-panel" aria-live="polite">
+        <div>
+          <span class="model-status-label">Active Inference & Policy Binding</span>
+          <strong id="model-status-title">Waiting for detector status</strong>
+          <p id="model-status-detail">The dashboard will identify the active model and whether its policy is calibrated before making recommendations.</p>
+          <div id="model-status-incompatibility" class="text-danger" style="margin-top: 0.35rem; font-size: 0.8rem; display: none;"></div>
+        </div>
+        <button class="btn" id="btn-open-evidence" type="button">Inspect SSM evidence</button>
       </div>
 
       <!-- 7-Step Interactive Guided Workflow -->
@@ -548,10 +561,10 @@
         <div class="comparison-card highlight" id="comp-card-hier">
           <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 0.5rem;">
             <strong style="color: var(--accent-purple);">Hierarchical SSM (Partial Pooling)</strong>
-            <span class="badge badge-class">RECOMMENDED</span>
+            <span class="badge badge-class">Active decision model</span>
           </div>
           <p style="font-size: 0.78rem; color: var(--text-muted); margin-bottom: 0.75rem;">
-            Shrinks host estimates toward class mean via Helmert contrast basis. Optimal balance of variance reduction and host specificity.
+            Shrinks host estimates toward a class mean via a Helmert contrast basis. Its score is a diagnostic until the displayed policy is calibrated for the matching regime.
           </p>
           <div style="font-size: 0.85rem; margin-bottom: 0.5rem;">
             Mean Effect: <span id="comp-hier-effect" style="font-family: var(--font-mono); font-weight: 700;">0.00%</span>
@@ -572,7 +585,7 @@
             <span class="badge badge-version">Baseline</span>
           </div>
           <p style="font-size: 0.78rem; color: var(--text-muted); margin-bottom: 0.75rem;">
-            Estimates each canary host in total isolation. High estimation variance on small samples; zero cross-host shrinkage.
+            Estimates each canary host in total isolation. It is shown for diagnostic comparison only; it has no live alert policy in this dashboard.
           </p>
           <div style="font-size: 0.85rem; margin-bottom: 0.5rem;">
             Mean Effect: <span id="comp-indep-effect" style="font-family: var(--font-mono); font-weight: 700;">0.00%</span>
@@ -593,7 +606,7 @@
             <span class="badge badge-warning">Pooled</span>
           </div>
           <p style="font-size: 0.78rem; color: var(--text-muted); margin-bottom: 0.75rem;">
-            Forces all canaries to share a single common effect parameter. High power when harm is uniform, but completely washes out isolated single-host harm.
+            Forces all canaries to share a single common effect parameter. It is shown for diagnostic comparison only; it can dilute isolated-host harm.
           </p>
           <div style="font-size: 0.85rem; margin-bottom: 0.5rem;">
             Mean Effect: <span id="comp-pooled-effect" style="font-family: var(--font-mono); font-weight: 700;">0.00%</span>
@@ -824,71 +837,13 @@
           <span class="badge badge-class">Gate G2 Audit</span>
         </div>
 
-        <div class="alert-box alert-danger" style="margin-bottom: 1rem;">
-          <strong>FAILED CALIBRATION AUDIT WARNING:</strong> In the benchmark audit (results/x04/x04_summary.md), <code>hier_rank0</code> FAILED Gate G2 under <code>S5_label_errors</code> (FAR = 9.65%, Clopper-Pearson CI [8.39%, 11.03%], Beta-Binomial \(p = 1.22 \times 10^{-8}\)). Omitting factor subtraction causes shared shocks to pool across imbalanced classes. That configuration is strictly INVALIDATED for deployment recommendations.
+        <div class="alert-box alert-warning" style="margin-bottom: 1rem;">
+          <strong>Read the live policy badge first.</strong> A dashboard recommendation is valid only when its active model, policy, regime, and calibration artifact are compatible. This demo exposes the model and policy identifiers, but does not load a calibration artifact by hash; therefore it is a teaching/replay interface, not a release-control plane.
         </div>
-
-        <div class="table-container">
-          <table>
-            <thead>
-              <tr>
-                <th>Method</th>
-                <th>Calibrated Threshold</th>
-                <th>Null Audits</th>
-                <th>Achieved FAR</th>
-                <th>95% Clopper-Pearson CI</th>
-                <th>Beta-Binomial p-value</th>
-                <th>Gate G2 Verdict</th>
-              </tr>
-            </thead>
-            <tbody>
-              <tr>
-                <td><strong>hier_ssm</strong> (Hierarchical SSM)</td>
-                <td>-1.14122</td>
-                <td>100</td>
-                <td>1.0%</td>
-                <td>[0.03%, 5.45%]</td>
-                <td>0.2116</td>
-                <td><span class="badge gate-badge-pass">PASS</span></td>
-              </tr>
-              <tr>
-                <td><strong>multi_channel</strong> (Latency + Memory)</td>
-                <td>-0.67302</td>
-                <td>100</td>
-                <td>0.0%</td>
-                <td>[0.00%, 3.62%]</td>
-                <td>0.0594</td>
-                <td><span class="badge gate-badge-pass">PASS</span></td>
-              </tr>
-              <tr>
-                <td><strong>indep_ssm</strong> (Independent SSM)</td>
-                <td>-1.97138</td>
-                <td>100</td>
-                <td>3.0%</td>
-                <td>[0.62%, 8.52%]</td>
-                <td>0.7209</td>
-                <td><span class="badge gate-badge-pass">PASS</span></td>
-              </tr>
-              <tr>
-                <td><strong>pooled_ssm</strong> (Complete Pooling)</td>
-                <td>-3.61976</td>
-                <td>100</td>
-                <td>1.0%</td>
-                <td>[0.03%, 5.45%]</td>
-                <td>0.2116</td>
-                <td><span class="badge gate-badge-pass">PASS</span></td>
-              </tr>
-              <tr style="background: rgba(239, 68, 68, 0.08);">
-                <td><strong>hier_rank0 (under S5_label_errors)</strong></td>
-                <td>-1.14122</td>
-                <td>2000</td>
-                <td>9.65%</td>
-                <td>[8.39%, 11.03%]</td>
-                <td>1.22e-08</td>
-                <td><span class="badge gate-badge-fail">FAILED GATE G2</span></td>
-              </tr>
-            </tbody>
-          </table>
+        <div class="audit-summary-grid">
+          <div><strong>Saved plain-regime audit</strong><br><span>Gate G2 artifact: 118 of 119 cells passed; the overall artifact is <strong>FAIL</strong> because <code>hier_rank0</code> failed under label errors.</span></div>
+          <div><strong>Known open limitation</strong><br><span>The shared-workload-step failure remains open. Do not infer step-regime validity from a plain-regime result.</span></div>
+          <div><strong>How to compare methods</strong><br><span>Only methods with a passing calibration gate in the displayed regime may be compared on delay or power.</span></div>
         </div>
       </div>
     </div>

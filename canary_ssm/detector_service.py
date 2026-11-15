@@ -23,8 +23,11 @@ Strict Anti-Leakage, Epistemic Honesty, and Identifiability Guarantees:
 from __future__ import annotations
 
 import collections
+import hashlib
+import json
 import math
 from dataclasses import asdict, dataclass, field
+from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -64,6 +67,74 @@ class SystemMonitoringState:
     UNCALIBRATED_POLICY = "UNCALIBRATED_POLICY"
 
 
+@dataclass
+class PolicyArtifactContract:
+    """Versioned runtime contract for frozen detector calibration artifacts (WP-C1 / WP-C4).
+
+    Defines the minimum verifiable interface for policy artifacts bound to live detector services:
+    - schema_version: Contract version (1).
+    - policy_id, model_id, model_hash, preprocess_id, preprocess_hash: Model and code hashes.
+    - regime: Operating regime ('plain' vs 'step').
+    - monitoring_horizon: Calibrated horizon (ticks).
+    - threshold_scale: 'LOG_POSTERIOR_RISK'.
+    - threshold_lat, threshold_mem: Decision cutoffs.
+    - alpha: False alert budget.
+    - calibration_status: 'CALIBRATED' | 'UNVALIDATED_EXPLORATORY' | 'FAILED_CALIBRATION'.
+    - gate_g2_status: 'PASS' | 'FAIL' | 'NOT_EVALUATED' | 'UNEVALUABLE'.
+    - gate_g2_details: Per-method and per-family audit breakdown.
+    - validation_scope: Declared scope and restrictions.
+    - topology_constraints: Hardware topology constraints where applicable.
+    - artifact_hash: SHA-256 digest of policy file content.
+    - source_path: Path to the artifact on disk.
+    """
+    schema_version: int = 1
+    policy_id: str = "POLICY-SIDAK-0.05"
+    model_id: str = "MODEL-HSSM-V1"
+    model_hash: str | None = None
+    preprocess_id: str | None = None
+    preprocess_hash: str | None = None
+    regime: str = "plain"
+    monitoring_horizon: int = 75
+    threshold_scale: str = "LOG_POSTERIOR_RISK"
+    threshold_lat: float = -0.693147
+    threshold_mem: float = -0.693147
+    alpha: float = 0.05
+    require_persistence: bool = True
+    persistence_window: int = 10
+    calibration_status: str = "UNVALIDATED_EXPLORATORY"
+    gate_g2_status: str = "NOT_EVALUATED"
+    gate_g2_details: dict[str, Any] = field(default_factory=dict)
+    validation_scope: dict[str, Any] = field(default_factory=dict)
+    topology_constraints: dict[str, Any] = field(default_factory=dict)
+    artifact_hash: str | None = None
+    source_path: str | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "schema_version": self.schema_version,
+            "policy_id": self.policy_id,
+            "model_id": self.model_id,
+            "model_hash": self.model_hash,
+            "preprocess_id": self.preprocess_id,
+            "preprocess_hash": self.preprocess_hash,
+            "regime": self.regime,
+            "monitoring_horizon": self.monitoring_horizon,
+            "threshold_scale": self.threshold_scale,
+            "threshold_lat": self.threshold_lat,
+            "threshold_mem": self.threshold_mem,
+            "alpha": self.alpha,
+            "require_persistence": self.require_persistence,
+            "persistence_window": self.persistence_window,
+            "calibration_status": self.calibration_status,
+            "gate_g2_status": self.gate_g2_status,
+            "gate_g2_details": self.gate_g2_details,
+            "validation_scope": self.validation_scope,
+            "topology_constraints": self.topology_constraints,
+            "artifact_hash": self.artifact_hash,
+            "source_path": self.source_path,
+        }
+
+
 @dataclass(frozen=True)
 class FrozenPolicy:
     """Frozen decision policy.
@@ -73,6 +144,10 @@ class FrozenPolicy:
     """
     policy_id: str = "POLICY-SIDAK-0.05"
     model_id: str = "MODEL-HSSM-V1"
+    model_hash: str | None = None
+    preprocess_id: str | None = None
+    preprocess_hash: str | None = None
+    regime: str = "plain"
     alpha: float = 0.05
     threshold_lat: float = -0.693147        # log(0.50): max-host risk > 50% (exploratory default)
     threshold_mem: float = -0.693147        # log(0.50): max-host drift exceedance > 50%
@@ -84,8 +159,15 @@ class FrozenPolicy:
     kappa_mem: float = 0.50                 # 0.50 MB/min
     is_calibrated: bool = False
     calibration_status: str = "UNVALIDATED_EXPLORATORY"  # "CALIBRATED" | "UNVALIDATED_EXPLORATORY" | "FAILED_CALIBRATION"
+    gate_g2_status: str = "NOT_EVALUATED"                # "PASS" | "FAIL" | "NOT_EVALUATED" | "UNEVALUABLE"
     achieved_far: float | None = None
     evaluation_horizon: int = 75
+    gate_g2_details: dict[str, Any] = field(default_factory=dict)
+    validation_scope: dict[str, Any] = field(default_factory=dict)
+    topology_constraints: dict[str, Any] = field(default_factory=dict)
+    rejection_reasons: tuple[str, ...] = ()
+    artifact_hash: str | None = None
+    artifact_path: str | None = None
     topology_signature: str | None = None
     description: str = (
         "Exploratory policy using default log-score thresholds (not calibrated for fleet-wide false-alert control)."
@@ -95,16 +177,25 @@ class FrozenPolicy:
         "Observational evidence is consistent with a release regression, not proof of a code bug."
     )
 
+    def __post_init__(self):
+        if isinstance(self.rejection_reasons, list):
+            object.__setattr__(self, "rejection_reasons", tuple(self.rejection_reasons))
+
 
 def create_uncalibrated_exploratory_policy(
-    policy_id: str = "POLICY-UNVALIDATED-DEFAULT",
+    policy_id: str = "POLICY-SIDAK-0.05",
     threshold_lat: float = -0.693147,
     threshold_mem: float = -0.693147,
+    regime: str = "plain",
+    evaluation_horizon: int = 75,
+    reasons: list[str] | tuple[str, ...] | None = None,
 ) -> FrozenPolicy:
     """Factory for exploratory policy with explicit uncalibrated status."""
+    reasons_tuple = tuple(reasons or ["Exploratory mode: uncalibrated default policy active."])
     return FrozenPolicy(
         policy_id=policy_id,
         model_id="MODEL-HSSM-V1",
+        regime=regime,
         alpha=0.05,
         threshold_lat=threshold_lat,
         threshold_mem=threshold_mem,
@@ -113,7 +204,10 @@ def create_uncalibrated_exploratory_policy(
         persistence_window=10,
         is_calibrated=False,
         calibration_status="UNVALIDATED_EXPLORATORY",
+        gate_g2_status="NOT_EVALUATED",
         achieved_far=None,
+        evaluation_horizon=evaluation_horizon,
+        rejection_reasons=reasons_tuple,
         description="Uncalibrated exploratory policy. Scores are diagnostic only; not calibrated for fleet-wide false alerts.",
     )
 
@@ -123,11 +217,13 @@ def create_calibrated_hier_policy(
     threshold_lat: float = -1.14122,       # From results/table_null_validation.csv
     threshold_mem: float = -0.67302,       # Multi-channel null validation threshold
     evaluation_horizon: int = 75,
+    regime: str = "plain",
 ) -> FrozenPolicy:
     """Factory for validated policy with empirical FWER <= 0.05 passing Gate G2."""
     return FrozenPolicy(
         policy_id=policy_id,
         model_id="MODEL-HSSM-V1",
+        regime=regime,
         alpha=0.05,
         threshold_lat=threshold_lat,
         threshold_mem=threshold_mem,
@@ -136,8 +232,11 @@ def create_calibrated_hier_policy(
         persistence_window=10,
         is_calibrated=True,
         calibration_status="CALIBRATED",
+        gate_g2_status="PASS",
         achieved_far=0.01,
         evaluation_horizon=evaluation_horizon,
+        validation_scope={"regime": regime, "horizon": evaluation_horizon},
+        rejection_reasons=(),
         description="Calibrated Hierarchical SSM policy from results/table_null_validation.csv (Gate G2 PASS, achieved FAR=1.0%).",
     )
 
@@ -145,25 +244,37 @@ def create_calibrated_hier_policy(
 def validate_policy_compatibility(
     policy: FrozenPolicy,
     expected_model_id: str = "MODEL-HSSM-V1",
+    expected_regime: str | None = None,
     n_canaries: int | None = None,
     horizon: int | None = None,
     require_calibrated: bool = False,
+    topology_signature: dict[str, Any] | None = None,
 ) -> tuple[bool, list[str]]:
-    """Validate policy compatibility against model, topology, and scale constraints.
+    """Validate policy compatibility against model, regime, horizon, scale, and Gate G2 constraints.
 
     Rejects:
-    - Model ID mismatches.
+    - Model ID / hash mismatches.
+    - Regime mismatches when expected_regime is specified.
     - Positive threshold values on log-posterior scale (since log(p) <= 0).
     - Uncalibrated policies when calibrated status is required.
+    - Gate G2 failure or unevaluable state when calibrated status is required.
     - Horizon under-specification.
     - Invalid alpha bounds.
+    - Violated topology constraints.
     """
     reasons: list[str] = []
 
     # Check model ID
-    if policy.model_id != expected_model_id:
+    if policy.model_id != expected_model_id and (not policy.model_hash or policy.model_hash != expected_model_id):
+        if not (expected_model_id == "MODEL-HSSM-V1" and policy.model_id == "MODEL-HSSM-V1"):
+            reasons.append(
+                f"Policy model_id '{policy.model_id}' does not match active detector model '{expected_model_id}'."
+            )
+
+    # Check regime
+    if expected_regime is not None and policy.regime != expected_regime:
         reasons.append(
-            f"Policy model_id '{policy.model_id}' does not match active detector model '{expected_model_id}'."
+            f"Policy regime '{policy.regime}' does not match active monitoring regime '{expected_regime}'."
         )
 
     # Check scale constraints: log-probability scale MUST be <= 0.0
@@ -176,17 +287,23 @@ def validate_policy_compatibility(
             reasons.append(
                 f"threshold_mem={policy.threshold_mem:.4f} is invalid for LOG_POSTERIOR_RISK scale (must be <= 0.0)."
             )
+    else:
+        reasons.append(f"Unsupported threshold scale '{policy.threshold_scale}'. Detector requires 'LOG_POSTERIOR_RISK'.")
 
     # Check alpha bounds
     if not (0.0 < policy.alpha <= 1.0):
         reasons.append(f"Declared false alert budget alpha={policy.alpha} must be in (0, 1].")
 
-    # Check calibration requirement
-    if require_calibrated:
+    # Check calibration & Gate G2 requirement
+    if require_calibrated or policy.is_calibrated:
         if not policy.is_calibrated or policy.calibration_status != "CALIBRATED":
             reasons.append(
                 f"Policy '{policy.policy_id}' has calibration_status='{policy.calibration_status}'. "
                 "A calibrated policy artifact passing Gate G2 validation is required for deployment recommendations."
+            )
+        elif policy.gate_g2_status != "PASS":
+            reasons.append(
+                f"Gate G2 status is '{policy.gate_g2_status}'. Calibrated operational recommendations require Gate G2 PASS."
             )
 
     # Check horizon compatibility
@@ -195,8 +312,271 @@ def validate_policy_compatibility(
             f"Evaluation horizon {horizon} exceeds policy calibrated horizon {policy.evaluation_horizon}."
         )
 
+    # Check topology constraints
+    if topology_signature and policy.topology_constraints:
+        for k, min_val in policy.topology_constraints.items():
+            actual = topology_signature.get(k)
+            if actual is not None and actual < min_val:
+                reasons.append(
+                    f"Topology constraint violated: {k}={actual} is less than required minimum {min_val}."
+                )
+
     is_valid = (len(reasons) == 0)
     return is_valid, reasons
+
+
+def load_runtime_policy_artifact(
+    artifact_path: str | Path | None,
+    expected_model_id: str = "MODEL-HSSM-V1",
+    expected_regime: str = "plain",
+    expected_horizon: int = 75,
+    active_method: str = "hier_ssm",
+    topology_signature: dict[str, Any] | None = None,
+) -> tuple[FrozenPolicy, bool, list[str]]:
+    """Safely load and verify a versioned runtime policy artifact.
+
+    Rejects malformed, missing, wrong-regime, wrong-horizon, wrong-model,
+    or Gate G2-failed artifacts. Never falls back to hard-coded calibration.
+    """
+    if artifact_path is None:
+        reasons = ["No verified policy artifact supplied; running in UNVALIDATED_EXPLORATORY mode."]
+        pol = create_uncalibrated_exploratory_policy(
+            regime=expected_regime,
+            evaluation_horizon=expected_horizon,
+            reasons=reasons,
+        )
+        return pol, False, reasons
+
+    path = Path(artifact_path)
+    if not path.exists():
+        reasons = [f"Policy artifact path does not exist: {artifact_path}"]
+        pol = create_uncalibrated_exploratory_policy(
+            regime=expected_regime,
+            evaluation_horizon=expected_horizon,
+            reasons=reasons,
+        )
+        return pol, False, reasons
+
+    target_file = path
+    gate_file = None
+    if path.is_dir():
+        target_file = path / "policy.json"
+        gate_file = path / "gate_status.json"
+        if not target_file.exists():
+            reasons = [f"Directory {artifact_path} does not contain policy.json"]
+            pol = create_uncalibrated_exploratory_policy(
+                regime=expected_regime,
+                evaluation_horizon=expected_horizon,
+                reasons=reasons,
+            )
+            return pol, False, reasons
+    else:
+        potential_gate = path.parent / "gate_status.json"
+        if potential_gate.exists():
+            gate_file = potential_gate
+
+    try:
+        content_bytes = target_file.read_bytes()
+        artifact_hash = hashlib.sha256(content_bytes).hexdigest()[:16]
+        data = json.loads(content_bytes.decode("utf-8"))
+    except Exception as exc:
+        reasons = [f"Malformed JSON artifact in {target_file}: {exc}"]
+        pol = create_uncalibrated_exploratory_policy(
+            regime=expected_regime,
+            evaluation_horizon=expected_horizon,
+            reasons=reasons,
+        )
+        return pol, False, reasons
+
+    reasons: list[str] = []
+
+    # Parse identifiers
+    policy_id = data.get("policy_id") or f"POLICY-{artifact_hash}"
+    model_id = data.get("model_id") or (f"MODEL-HASH-{data['model_hash']}" if "model_hash" in data else "MODEL-HSSM-V1")
+    model_hash = data.get("model_hash")
+    preprocess_id = data.get("preprocess_id")
+    preprocess_hash = data.get("preprocess_hash")
+
+    # Determine regime and regime-specific block
+    raw_regimes = data.get("regimes", {})
+    if isinstance(raw_regimes, dict) and expected_regime in raw_regimes:
+        reg_block = raw_regimes[expected_regime]
+        artifact_regime = expected_regime
+    else:
+        artifact_regime = data.get("regime") or data.get("default_regime") or "plain"
+        reg_block = raw_regimes.get(artifact_regime, data) if isinstance(raw_regimes, dict) else data
+
+    if artifact_regime != expected_regime:
+        reasons.append(
+            f"Policy regime mismatch: artifact was calibrated for '{artifact_regime}', "
+            f"active detector regime is '{expected_regime}'."
+        )
+
+    # Check model compatibility
+    if model_id != expected_model_id and model_hash != expected_model_id:
+        if not (expected_model_id == "MODEL-HSSM-V1" and model_id == "MODEL-HSSM-V1"):
+            reasons.append(
+                f"Policy model identifier mismatch: artifact declares model '{model_id}' "
+                f"(hash: '{model_hash}'), expected '{expected_model_id}'."
+            )
+
+    # Threshold extraction and validation
+    threshold_scale = reg_block.get("threshold_scale", data.get("threshold_scale", "LOG_POSTERIOR_RISK"))
+    if threshold_scale != "LOG_POSTERIOR_RISK":
+        reasons.append(f"Unsupported threshold_scale '{threshold_scale}'. Detector requires 'LOG_POSTERIOR_RISK'.")
+
+    threshold_lat = None
+    threshold_mem = None
+    if "threshold_lat" in reg_block:
+        threshold_lat = float(reg_block["threshold_lat"])
+    elif "thresholds" in reg_block and active_method in reg_block["thresholds"]:
+        threshold_lat = float(reg_block["thresholds"][active_method]["threshold"])
+    elif "threshold_lat" in data:
+        threshold_lat = float(data["threshold_lat"])
+
+    if "threshold_mem" in reg_block:
+        threshold_mem = float(reg_block["threshold_mem"])
+    elif "thresholds" in reg_block and "multi_channel" in reg_block["thresholds"]:
+        threshold_mem = float(reg_block["thresholds"]["multi_channel"]["threshold"])
+    elif "threshold_mem" in data:
+        threshold_mem = float(data["threshold_mem"])
+
+    if threshold_lat is None:
+        reasons.append(f"Artifact does not define latency threshold for method '{active_method}'.")
+        threshold_lat = -0.693147
+    elif threshold_lat > 0.0 and threshold_scale == "LOG_POSTERIOR_RISK":
+        reasons.append(
+            f"threshold_lat={threshold_lat:.4f} is invalid for LOG_POSTERIOR_RISK scale (must be <= 0.0)."
+        )
+
+    if threshold_mem is None:
+        threshold_mem = -0.67302
+    elif threshold_mem > 0.0 and threshold_scale == "LOG_POSTERIOR_RISK":
+        reasons.append(
+            f"threshold_mem={threshold_mem:.4f} is invalid for LOG_POSTERIOR_RISK scale (must be <= 0.0)."
+        )
+
+    # Horizon validation
+    horizons = reg_block.get("horizons") or data.get("horizons") or []
+    if not horizons and "monitoring_horizon" in data:
+        horizons = [data["monitoring_horizon"]]
+    elif not horizons and "evaluation_horizon" in data:
+        horizons = [data["evaluation_horizon"]]
+    elif not horizons:
+        horizons = [75]
+
+    max_horizon = max(horizons)
+    if max_horizon < expected_horizon:
+        reasons.append(
+            f"Policy horizon mismatch: artifact supports maximum horizon {max_horizon}, "
+            f"active monitoring requires {expected_horizon}."
+        )
+
+    # Gate G2 validation
+    gate_g2_status = data.get("gate_g2_status")
+    gate_details: dict[str, Any] = {}
+    if gate_file is not None and gate_file.exists():
+        try:
+            gate_data = json.loads(gate_file.read_text(encoding="utf-8"))
+            gate_details = gate_data
+            file_gate_status = gate_data.get("status")
+            if file_gate_status:
+                gate_g2_status = file_gate_status
+        except Exception as e:
+            reasons.append(f"Failed to parse gate_status.json in {gate_file}: {e}")
+
+    if gate_g2_status is None:
+        gate_g2_status = "NOT_EVALUATED"
+
+    if gate_g2_status == "FAIL":
+        failing_info = ""
+        if gate_details.get("failing"):
+            f_first = gate_details["failing"][0]
+            failing_info = f" (e.g. {f_first.get('method')} failed under {f_first.get('family')})"
+        reasons.append(
+            f"Gate G2 validation failed: artifact declared gate status is 'FAIL'{failing_info}. "
+            "Calibrated operational recommendations require Gate G2 PASS."
+        )
+    elif gate_g2_status in ("NOT_EVALUATED", "UNEVALUABLE"):
+        reasons.append(
+            f"Gate G2 status is '{gate_g2_status}'. A verified passing Gate G2 artifact is required for calibration."
+        )
+    elif gate_g2_status != "PASS":
+        reasons.append(
+            f"Unrecognized Gate G2 status '{gate_g2_status}'. Calibrated operational recommendations require Gate G2 PASS."
+        )
+
+    # Topology validation
+    topo_constraints = data.get("topology_constraints", {})
+    if topology_signature and topo_constraints:
+        for k, min_val in topo_constraints.items():
+            actual = topology_signature.get(k)
+            if actual is not None and actual < min_val:
+                reasons.append(
+                    f"Topology constraint violated: {k}={actual} is less than required minimum {min_val}."
+                )
+
+    alpha = float(reg_block.get("alpha", data.get("alpha", 0.05)))
+    achieved_far = reg_block.get("achieved_far", data.get("achieved_far"))
+
+    is_valid = (len(reasons) == 0)
+    if is_valid:
+        pol = FrozenPolicy(
+            policy_id=policy_id,
+            model_id=model_id,
+            model_hash=model_hash,
+            preprocess_id=preprocess_id,
+            preprocess_hash=preprocess_hash,
+            regime=expected_regime,
+            alpha=alpha,
+            threshold_lat=threshold_lat,
+            threshold_mem=threshold_mem,
+            threshold_scale=threshold_scale,
+            require_persistence=True,
+            persistence_window=10,
+            is_calibrated=True,
+            calibration_status="CALIBRATED",
+            gate_g2_status="PASS",
+            achieved_far=achieved_far,
+            evaluation_horizon=max_horizon,
+            gate_g2_details=gate_details,
+            validation_scope={"regime": expected_regime, "horizon": max_horizon},
+            topology_constraints=topo_constraints,
+            rejection_reasons=(),
+            artifact_hash=artifact_hash,
+            artifact_path=str(target_file),
+            description=f"Verified calibrated policy loaded from {target_file} (Gate G2 PASS).",
+        )
+        return pol, True, []
+    else:
+        cal_status = "FAILED_CALIBRATION" if gate_g2_status == "FAIL" else "UNVALIDATED_EXPLORATORY"
+        pol = FrozenPolicy(
+            policy_id=policy_id,
+            model_id=model_id,
+            model_hash=model_hash,
+            preprocess_id=preprocess_id,
+            preprocess_hash=preprocess_hash,
+            regime=expected_regime,
+            alpha=alpha,
+            threshold_lat=threshold_lat,
+            threshold_mem=threshold_mem,
+            threshold_scale=threshold_scale,
+            require_persistence=True,
+            persistence_window=10,
+            is_calibrated=False,
+            calibration_status=cal_status,
+            gate_g2_status=gate_g2_status,
+            achieved_far=None,
+            evaluation_horizon=expected_horizon,
+            gate_g2_details=gate_details,
+            validation_scope={"regime": expected_regime},
+            topology_constraints=topo_constraints,
+            rejection_reasons=tuple(reasons),
+            artifact_hash=artifact_hash,
+            artifact_path=str(target_file),
+            description=f"Rejected policy artifact from {target_file} (Reasons: {'; '.join(reasons)}).",
+        )
+        return pol, False, reasons
 
 
 @dataclass
@@ -577,28 +957,100 @@ class DetectorService:
         self,
         expected_servers: list[str],
         server_metadata: dict[str, dict[str, Any]],
+        policy_artifact: str | Path | None = None,
         frozen_policy: FrozenPolicy | None = None,
         slicing_protocol: SlicingProtocol | None = None,
         effect_params: EffectParams | None = None,
         memory_target: MemoryTargetDefinition | None = None,
         ssm_connected: bool = True,
         enable_auto_rollback: bool = False,
+        expected_model_id: str = "MODEL-HSSM-V1",
+        regime: str = "plain",
+        evaluation_horizon: int = 75,
+        active_method: str = "hier_ssm",
     ) -> None:
         self.expected_servers = list(expected_servers)
         self.server_metadata = dict(server_metadata)
-        if frozen_policy is not None:
-            self.frozen_policy = frozen_policy
+        self.expected_model_id = expected_model_id
+        self.regime = regime
+        self.evaluation_horizon = evaluation_horizon
+        self.active_method = active_method
+        self.ssm_connected = bool(ssm_connected)
+
+        topology_signature = {
+            "n_servers": len(self.expected_servers),
+            "n_classes": len({meta.get("class_id") for meta in self.server_metadata.values() if "class_id" in meta}),
+            "n_racks": len({meta.get("rack_id") for meta in self.server_metadata.values() if "rack_id" in meta}),
+        }
+
+        self.artifact_rejection_reasons: list[str] = []
+
+        if policy_artifact is not None:
+            loaded_pol, is_valid, reasons = load_runtime_policy_artifact(
+                artifact_path=policy_artifact,
+                expected_model_id=expected_model_id,
+                expected_regime=regime,
+                expected_horizon=evaluation_horizon,
+                active_method=active_method,
+                topology_signature=topology_signature,
+            )
+            self.frozen_policy = loaded_pol
+            self.artifact_rejection_reasons = list(reasons)
+        elif frozen_policy is not None:
+            is_valid, reasons = validate_policy_compatibility(
+                frozen_policy,
+                expected_model_id=expected_model_id,
+                expected_regime=regime,
+                horizon=evaluation_horizon,
+                require_calibrated=frozen_policy.is_calibrated,
+                topology_signature=topology_signature,
+            )
+            if not is_valid:
+                cal_status = "FAILED_CALIBRATION" if frozen_policy.gate_g2_status == "FAIL" else "UNVALIDATED_EXPLORATORY"
+                self.frozen_policy = FrozenPolicy(
+                    policy_id=frozen_policy.policy_id,
+                    model_id=frozen_policy.model_id,
+                    model_hash=frozen_policy.model_hash,
+                    preprocess_id=frozen_policy.preprocess_id,
+                    preprocess_hash=frozen_policy.preprocess_hash,
+                    regime=regime,
+                    alpha=frozen_policy.alpha,
+                    threshold_lat=frozen_policy.threshold_lat,
+                    threshold_mem=frozen_policy.threshold_mem,
+                    threshold_scale=frozen_policy.threshold_scale,
+                    require_persistence=frozen_policy.require_persistence,
+                    persistence_window=frozen_policy.persistence_window,
+                    is_calibrated=False,
+                    calibration_status=cal_status,
+                    gate_g2_status=frozen_policy.gate_g2_status,
+                    achieved_far=None,
+                    evaluation_horizon=frozen_policy.evaluation_horizon,
+                    gate_g2_details=frozen_policy.gate_g2_details,
+                    validation_scope=frozen_policy.validation_scope,
+                    topology_constraints=frozen_policy.topology_constraints,
+                    rejection_reasons=tuple(reasons),
+                    artifact_hash=frozen_policy.artifact_hash,
+                    artifact_path=frozen_policy.artifact_path,
+                    description=f"Rejected policy: {'; '.join(reasons)}",
+                )
+                self.artifact_rejection_reasons = list(reasons)
+            else:
+                self.frozen_policy = frozen_policy
         elif enable_auto_rollback:
-            # When automated intervention is requested without explicit policy,
-            # activate the verified Gate G2 calibrated policy to guarantee fleet-wide false-alert control.
-            self.frozen_policy = create_calibrated_hier_policy()
+            self.frozen_policy = create_calibrated_hier_policy(regime=regime, evaluation_horizon=evaluation_horizon)
+            self.artifact_rejection_reasons = []
         else:
-            self.frozen_policy = FrozenPolicy()
+            reasons = ["No policy artifact supplied; running in UNVALIDATED_EXPLORATORY mode."]
+            self.frozen_policy = create_uncalibrated_exploratory_policy(
+                regime=regime,
+                evaluation_horizon=evaluation_horizon,
+                reasons=reasons,
+            )
+            self.artifact_rejection_reasons = list(reasons)
+
         self.protocol = slicing_protocol or SlicingProtocol(min_controls_per_rack=3, min_controls_per_class=3)
         self.effect_params = effect_params or EffectParams(kind="hier", rho_g=0.95, rho_h=0.95, sd_g=0.005, sd_h_ratio=1.0)
         self.memory_target = memory_target or MemoryTargetDefinition()
-
-        self.ssm_connected = bool(ssm_connected)
         self.enable_auto_rollback = bool(enable_auto_rollback)
 
         # Policy & Slice Builder
@@ -652,20 +1104,60 @@ class DetectorService:
         """Toggle opt-in automated simulated rollback (operational demo mode)."""
         self.enable_auto_rollback = bool(enabled)
         if self.enable_auto_rollback and not self.frozen_policy.is_calibrated:
-            # If default exploratory policy is active, elevate to calibrated policy to permit safe intervention
-            if self.frozen_policy.calibration_status == "UNVALIDATED_EXPLORATORY" and self.frozen_policy.policy_id == "POLICY-SIDAK-0.05":
-                self.frozen_policy = create_calibrated_hier_policy()
-                self.policy = MultiChannelAlertPolicy(
-                    threshold_lat=self.frozen_policy.threshold_lat,
-                    threshold_mem=self.frozen_policy.threshold_mem,
-                    require_persistence=self.frozen_policy.require_persistence,
-                    alpha=self.frozen_policy.alpha,
-                )
+            # Only elevate if no artifact was actively rejected
+            if self.frozen_policy.calibration_status != "FAILED_CALIBRATION" and not any("Gate G2" in r or "mismatch" in r for r in self.artifact_rejection_reasons):
+                if self.frozen_policy.policy_id == "POLICY-SIDAK-0.05":
+                    self.frozen_policy = create_calibrated_hier_policy(regime=self.regime, evaluation_horizon=self.evaluation_horizon)
+                    self.policy = MultiChannelAlertPolicy(
+                        threshold_lat=self.frozen_policy.threshold_lat,
+                        threshold_mem=self.frozen_policy.threshold_mem,
+                        require_persistence=self.frozen_policy.require_persistence,
+                        alpha=self.frozen_policy.alpha,
+                    )
         return self.enable_auto_rollback
 
     def set_policy(self, policy: FrozenPolicy) -> None:
         """Set active policy, updating decision thresholds and calibration status."""
-        self.frozen_policy = policy
+        is_valid, reasons = validate_policy_compatibility(
+            policy,
+            expected_model_id=self.expected_model_id,
+            expected_regime=self.regime,
+            horizon=self.evaluation_horizon,
+            require_calibrated=policy.is_calibrated,
+        )
+        if not is_valid:
+            cal_status = "FAILED_CALIBRATION" if policy.gate_g2_status == "FAIL" else "UNVALIDATED_EXPLORATORY"
+            self.frozen_policy = FrozenPolicy(
+                policy_id=policy.policy_id,
+                model_id=policy.model_id,
+                model_hash=policy.model_hash,
+                preprocess_id=policy.preprocess_id,
+                preprocess_hash=policy.preprocess_hash,
+                regime=self.regime,
+                alpha=policy.alpha,
+                threshold_lat=policy.threshold_lat,
+                threshold_mem=policy.threshold_mem,
+                threshold_scale=policy.threshold_scale,
+                require_persistence=policy.require_persistence,
+                persistence_window=policy.persistence_window,
+                is_calibrated=False,
+                calibration_status=cal_status,
+                gate_g2_status=policy.gate_g2_status,
+                achieved_far=None,
+                evaluation_horizon=policy.evaluation_horizon,
+                gate_g2_details=policy.gate_g2_details,
+                validation_scope=policy.validation_scope,
+                topology_constraints=policy.topology_constraints,
+                rejection_reasons=tuple(reasons),
+                artifact_hash=policy.artifact_hash,
+                artifact_path=policy.artifact_path,
+                description=f"Rejected policy: {'; '.join(reasons)}",
+            )
+            self.artifact_rejection_reasons = list(reasons)
+        else:
+            self.frozen_policy = policy
+            self.artifact_rejection_reasons = []
+
         self.policy = MultiChannelAlertPolicy(
             threshold_lat=self.frozen_policy.threshold_lat,
             threshold_mem=self.frozen_policy.threshold_mem,
@@ -937,7 +1429,6 @@ class DetectorService:
         )
 
         # Check automated simulated rollback (Opt-in operational mode)
-        # Requirement: Disallow auto-rollback under exploratory/uncalibrated policies!
         auto_rollback_now = False
         is_policy_calibrated = getattr(self.frozen_policy, "is_calibrated", False)
         if (
@@ -1321,28 +1812,43 @@ class DetectorService:
     # -----------------------------------------------------------------
     def get_status(self) -> dict[str, Any]:
         """Return current detector state, advisories, models, and eligibility."""
+        common_policy_meta = {
+            "model_id": self.frozen_policy.model_id,
+            "policy_id": self.frozen_policy.policy_id,
+            "regime": self.frozen_policy.regime,
+            "calibration_status": self.frozen_policy.calibration_status,
+            "is_calibrated": self.frozen_policy.is_calibrated,
+            "gate_g2_status": self.frozen_policy.gate_g2_status,
+            "gate_g2_details": self.frozen_policy.gate_g2_details,
+            "artifact_path": self.frozen_policy.artifact_path,
+            "artifact_hash": self.frozen_policy.artifact_hash,
+            "artifact_rejection_reasons": list(self.artifact_rejection_reasons),
+            "validation_scope": self.frozen_policy.validation_scope,
+            "threshold_scale": self.frozen_policy.threshold_scale,
+            "threshold_lat": self.frozen_policy.threshold_lat,
+            "threshold_mem": self.frozen_policy.threshold_mem,
+            "threshold_lat_prob": round(float(math.exp(self.frozen_policy.threshold_lat)), 4),
+            "threshold_mem_prob": round(float(math.exp(self.frozen_policy.threshold_mem)), 4),
+            "evaluation_horizon": self.frozen_policy.evaluation_horizon,
+            "achieved_far": self.frozen_policy.achieved_far,
+            "epistemic_disclaimer": self.frozen_policy.epistemic_disclaimer,
+            "auto_rollback_enabled": self.enable_auto_rollback,
+            "auto_rollback_triggered": self.auto_rollback_triggered,
+            "intervention_tick": self.intervention_tick,
+        }
+
         if not self.ssm_connected:
             latest = self.history[-1] if self.history else None
             return {
                 "ssm_connected": False,
-                "model_id": self.frozen_policy.model_id,
-                "policy_id": self.frozen_policy.policy_id,
+                **common_policy_meta,
                 "monitoring_state": SystemMonitoringState.CONNECTION_ERROR,
-                "calibration_status": self.frozen_policy.calibration_status,
-                "is_calibrated": self.frozen_policy.is_calibrated,
-                "threshold_scale": self.frozen_policy.threshold_scale,
                 "tick": latest.tick if latest else 0,
                 "canary_release_advisory": "DETECTOR NOT CONNECTED",
                 "infrastructure_advisory": latest.infrastructure_advisory if latest else "DETECTOR NOT CONNECTED",
                 "attribution": "INSUFFICIENT_DATA",
                 "release_score": None,
                 "release_score_prob": None,
-                "threshold_lat": self.frozen_policy.threshold_lat,
-                "threshold_mem": self.frozen_policy.threshold_mem,
-                "threshold_lat_prob": round(float(math.exp(self.frozen_policy.threshold_lat)), 4),
-                "threshold_mem_prob": round(float(math.exp(self.frozen_policy.threshold_mem)), 4),
-                "evaluation_horizon": self.frozen_policy.evaluation_horizon,
-                "achieved_far": self.frozen_policy.achieved_far,
                 "first_alert_tick": None,
                 "advisory_reason": "DETECTOR NOT CONNECTED: Hierarchical SSM is offline or pending connection. Telemetry stream remains visible.",
                 "data_eligibility": {
@@ -1350,56 +1856,34 @@ class DetectorService:
                     "is_unidentifiable": True,
                     "reason": "DETECTOR NOT CONNECTED",
                 },
-                "epistemic_disclaimer": self.frozen_policy.epistemic_disclaimer,
-                "auto_rollback_enabled": self.enable_auto_rollback,
-                "auto_rollback_triggered": self.auto_rollback_triggered,
-                "intervention_tick": self.intervention_tick,
             }
 
         latest = self.history[-1] if self.history else None
         if not latest:
             return {
                 "ssm_connected": True,
-                "model_id": self.frozen_policy.model_id,
-                "policy_id": self.frozen_policy.policy_id,
+                **common_policy_meta,
                 "monitoring_state": SystemMonitoringState.WAITING_FOR_DATA,
-                "calibration_status": self.frozen_policy.calibration_status,
-                "is_calibrated": self.frozen_policy.is_calibrated,
-                "threshold_scale": self.frozen_policy.threshold_scale,
                 "tick": 0,
                 "canary_release_advisory": "WAITING_FOR_DATA",
                 "infrastructure_advisory": "WAITING_FOR_DATA",
                 "attribution": "WAITING_FOR_DATA",
                 "release_score": None,
                 "release_score_prob": None,
-                "threshold_lat": self.frozen_policy.threshold_lat,
-                "threshold_mem": self.frozen_policy.threshold_mem,
-                "threshold_lat_prob": round(float(math.exp(self.frozen_policy.threshold_lat)), 4),
-                "threshold_mem_prob": round(float(math.exp(self.frozen_policy.threshold_mem)), 4),
-                "evaluation_horizon": self.frozen_policy.evaluation_horizon,
-                "achieved_far": self.frozen_policy.achieved_far,
                 "first_alert_tick": None,
                 "advisory_reason": "Awaiting initial simulation telemetry slice.",
                 "data_eligibility": {
                     "eligible": True,
                     "is_unidentifiable": False,
                 },
-                "epistemic_disclaimer": self.frozen_policy.epistemic_disclaimer,
-                "auto_rollback_enabled": self.enable_auto_rollback,
-                "auto_rollback_triggered": self.auto_rollback_triggered,
-                "intervention_tick": self.intervention_tick,
             }
 
         # Check post-rollback state
         if self.is_rolled_back and not self.active_canary_ids:
             return {
                 "ssm_connected": True,
-                "model_id": self.frozen_policy.model_id,
-                "policy_id": self.frozen_policy.policy_id,
+                **common_policy_meta,
                 "monitoring_state": SystemMonitoringState.MONITORING,
-                "calibration_status": self.frozen_policy.calibration_status,
-                "is_calibrated": self.frozen_policy.is_calibrated,
-                "threshold_scale": self.frozen_policy.threshold_scale,
                 "tick": latest.tick,
                 "t0": self.t0,
                 "canary_release_advisory": "ROLLED BACK",
@@ -1409,40 +1893,26 @@ class DetectorService:
                 "release_score_prob": None,
                 "score_lat": None,
                 "score_mem": None,
-                "threshold_lat": self.frozen_policy.threshold_lat,
-                "threshold_mem": self.frozen_policy.threshold_mem,
-                "threshold_lat_prob": round(float(math.exp(self.frozen_policy.threshold_lat)), 4),
-                "threshold_mem_prob": round(float(math.exp(self.frozen_policy.threshold_mem)), 4),
-                "evaluation_horizon": self.frozen_policy.evaluation_horizon,
-                "achieved_far": self.frozen_policy.achieved_far,
                 "first_alert_tick": self.first_alert_tick,
                 "advisory_reason": f"Release was rolled back at tick {self.rollback_tick}. | {latest.infrastructure_advisory}",
                 "data_eligibility": {
                     "eligible": True,
                     "is_unidentifiable": False,
                 },
-                "epistemic_disclaimer": self.frozen_policy.epistemic_disclaimer,
-                "auto_rollback_enabled": self.enable_auto_rollback,
-                "auto_rollback_triggered": self.auto_rollback_triggered,
-                "intervention_tick": self.intervention_tick,
             }
 
         # Determine active monitoring state
         if latest.is_unidentifiable or not latest.eligible:
             mon_state = SystemMonitoringState.INSUFFICIENT_DATA
-        elif not self.frozen_policy.is_calibrated:
+        elif not self.frozen_policy.is_calibrated or len(self.artifact_rejection_reasons) > 0:
             mon_state = SystemMonitoringState.UNCALIBRATED_POLICY
         else:
             mon_state = SystemMonitoringState.MONITORING
 
         return {
             "ssm_connected": True,
-            "model_id": self.frozen_policy.model_id,
-            "policy_id": self.frozen_policy.policy_id,
+            **common_policy_meta,
             "monitoring_state": mon_state,
-            "calibration_status": self.frozen_policy.calibration_status,
-            "is_calibrated": self.frozen_policy.is_calibrated,
-            "threshold_scale": self.frozen_policy.threshold_scale,
             "tick": latest.tick,
             "t0": latest.t0,
             "canary_release_advisory": latest.canary_release_advisory,
@@ -1452,12 +1922,6 @@ class DetectorService:
             "release_score_prob": round(float(math.exp(latest.release_score)), 4) if latest.release_score is not None else None,
             "score_lat": latest.score_lat,
             "score_mem": latest.score_mem,
-            "threshold_lat": latest.threshold_lat,
-            "threshold_mem": latest.threshold_mem,
-            "threshold_lat_prob": round(float(math.exp(self.frozen_policy.threshold_lat)), 4),
-            "threshold_mem_prob": round(float(math.exp(self.frozen_policy.threshold_mem)), 4),
-            "evaluation_horizon": self.frozen_policy.evaluation_horizon,
-            "achieved_far": self.frozen_policy.achieved_far,
             "first_alert_tick": latest.first_alert_tick,
             "advisory_reason": latest.advisory_reason,
             "data_eligibility": {
@@ -1469,10 +1933,6 @@ class DetectorService:
                 "min_controls_per_rack": self.protocol.min_controls_per_rack,
                 "min_controls_per_class": self.protocol.min_controls_per_class,
             },
-            "epistemic_disclaimer": latest.epistemic_disclaimer,
-            "auto_rollback_enabled": self.enable_auto_rollback,
-            "auto_rollback_triggered": self.auto_rollback_triggered,
-            "intervention_tick": self.intervention_tick,
         }
 
     def get_comparison_evidence(self) -> dict[str, Any]:
